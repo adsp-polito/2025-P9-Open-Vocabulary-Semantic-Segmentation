@@ -10,7 +10,7 @@ MODEL:
     NUM_CLASSES: 40
     TRAIN_CLASS_JSON: "datasets/landdiscover.json"
     TEST_CLASS_JSON: "datasets/potsdam.json"
-    CLIP_PRETRAINED: "ViT-B/16"
+    CLIP_PRETRAINED: "RN101"
     PROMPT_DEPTH: 0
     PROMPT_LENGTH: 0
     TEXT_GUIDANCE_DIM: 512

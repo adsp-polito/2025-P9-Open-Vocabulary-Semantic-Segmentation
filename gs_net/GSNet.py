@@ -125,28 +125,69 @@ class GSNet(nn.Module):
 
 
         self.sliding_window = sliding_window
-        if clip_pretrained == "ViT-B/16": 
+        if clip_pretrained == "ViT-B/16":
             self.clip_resolution = (384, 384)
         elif clip_pretrained == "RemoteCLIP-ViT-B-32":
             self.clip_resolution = (768,768)
-        else: 
+        elif clip_pretrained == "RN101" or clip_pretrained == "RN50":
+            self.clip_resolution = (224, 224)
+        else:
             self.clip_resolution = (336, 336)
         self.dino_resolution = (384,384)
-        self.proj_dim = 768 if clip_pretrained == "ViT-B/16" or clip_pretrained == "RemoteCLIP-ViT-B-32" else 1024
+        # RN101 uses 512-dim embeddings, ViT-B/16 uses 768-dim, ViT-L uses 1024-dim
+        if clip_pretrained == "RN101" or clip_pretrained == "RN50":
+            self.proj_dim = 512
+        elif clip_pretrained == "ViT-B/16" or clip_pretrained == "RemoteCLIP-ViT-B-32":
+            self.proj_dim = 768
+        else:
+            self.proj_dim = 1024
 
+        print(f"[GSNet] CLIP Configuration:")
+        print(f"  - Model: {clip_pretrained}")
+        print(f"  - Resolution: {self.clip_resolution}")
+        print(f"  - Projection Dim: {self.proj_dim}")
+        print(f"  - Architecture: {'ResNet' if clip_pretrained in ['RN50', 'RN101', 'RN50x4', 'RN50x16', 'RN50x64'] else 'Vision Transformer'}")
 
-        self.upsample1 = nn.ConvTranspose2d(self.proj_dim, 256, kernel_size=2, stride=2) if self.use_clip and self.clip_decod_dim[0]!=0 else None
-        self.upsample2 = nn.ConvTranspose2d(self.proj_dim, 128, kernel_size=4, stride=4) if self.use_clip and self.clip_decod_dim[1]!=0 else None
+        # Determine if using ResNet architecture
+        self.is_resnet = clip_pretrained in ["RN50", "RN101", "RN50x4", "RN50x16", "RN50x64"]
+
+        # For ResNet, we need projection layers to match channel dimensions
+        # RN101: layer2=512ch, layer3=1024ch -> need to project to match expected dims
+        if self.is_resnet:
+            # Project ResNet features to match expected dimensions
+            self.resnet_layer2_proj = nn.Conv2d(512, self.proj_dim, kernel_size=1) if self.use_clip else None
+            self.resnet_layer3_proj = nn.Conv2d(1024, self.proj_dim, kernel_size=1) if self.use_clip else None
+            self.upsample1 = nn.ConvTranspose2d(self.proj_dim, 256, kernel_size=2, stride=2) if self.use_clip and self.clip_decod_dim[0]!=0 else None
+            self.upsample2 = nn.ConvTranspose2d(self.proj_dim, 128, kernel_size=4, stride=4) if self.use_clip and self.clip_decod_dim[1]!=0 else None
+        else:
+            # For ViT, use standard upsample layers
+            self.resnet_layer2_proj = None
+            self.resnet_layer3_proj = None
+            self.upsample1 = nn.ConvTranspose2d(self.proj_dim, 256, kernel_size=2, stride=2) if self.use_clip and self.clip_decod_dim[0]!=0 else None
+            self.upsample2 = nn.ConvTranspose2d(self.proj_dim, 128, kernel_size=4, stride=4) if self.use_clip and self.clip_decod_dim[1]!=0 else None
         
         self.dino_decod_proj1 = nn.Conv2d(in_channels = 768, out_channels=256, kernel_size=1, stride=1, padding=0) if self.dino_model and self.dino_decod_dim[0]!=0 else None
         self.dino_decod_proj2 = nn.ConvTranspose2d(in_channels= 768, out_channels=128, kernel_size=2, stride=2) if self.dino_model and self.dino_decod_dim[0]!=0 else None
         
         self.dino_down_sample = nn.Conv2d(in_channels=768, out_channels=512, kernel_size=2, stride=2, padding=0) if self.dino_model else None
-        self.layer_indexes = [3, 7] if clip_pretrained == "ViT-B/16" or clip_pretrained == "RemoteCLIP-ViT-B-32" else [7, 15] 
-        self.layers = []
-        if self.use_clip:
-            for l in self.layer_indexes:
-                self.sem_seg_head.predictor.clip_model.visual.transformer.resblocks[l].register_forward_hook(lambda m, _, o: self.layers.append(o))
+
+        # Determine if using Vision Transformer or ResNet backbone
+        self.is_resnet = clip_pretrained in ["RN50", "RN101", "RN50x4", "RN50x16", "RN50x64"]
+
+        if not self.is_resnet:
+            # For ViT models, use transformer block hooks
+            self.layer_indexes = [3, 7] if clip_pretrained == "ViT-B/16" or clip_pretrained == "RemoteCLIP-ViT-B-32" else [7, 15]
+            self.layers = []
+            if self.use_clip:
+                for l in self.layer_indexes:
+                    self.sem_seg_head.predictor.clip_model.visual.transformer.resblocks[l].register_forward_hook(lambda m, _, o: self.layers.append(o))
+        else:
+            # For ResNet models, use layer hooks instead
+            self.layers = []
+            if self.use_clip:
+                # Hook into layer2 and layer3 for intermediate features
+                self.sem_seg_head.predictor.clip_model.visual.layer2.register_forward_hook(lambda m, _, o: self.layers.append(o))
+                self.sem_seg_head.predictor.clip_model.visual.layer3.register_forward_hook(lambda m, _, o: self.layers.append(o))
 
 
     @classmethod
@@ -281,13 +322,58 @@ class GSNet(nn.Module):
         
         if self.use_clip:
             clip_features = self.sem_seg_head.predictor.clip_model.encode_image(clip_images_resized, dense=True)
-            clip_image_features = clip_features[:, 1:, :]
-            res3 = rearrange(clip_image_features, "B (H W) C -> B C H W", H=24)
-            res4 = rearrange(self.layers[0][1:, :, :], "(H W) B C -> B C H W", H=24)
-            res5 = rearrange(self.layers[1][1:, :, :], "(H W) B C -> B C H W", H=24)
-            res4 = self.upsample1(res4) if self.upsample1 is not None else None
-            res5 = self.upsample2(res5) if self.upsample2 is not None else None
-            
+
+            if self.is_resnet:
+                # For ResNet: features are already in spatial format (B, C, H, W)
+                # self.layers[0] is layer2 output (512 channels), self.layers[1] is layer3 output (1024 channels)
+                res4_resnet = self.layers[0]  # layer2 features: (B, 512, H, W)
+                res5_resnet = self.layers[1]  # layer3 features: (B, 1024, H, W)
+
+                # ResNet output from attnpool is (B, 512) - need to reshape to match ViT format
+                # ViT outputs (B, num_patches+1, C), so we need to convert ResNet (B, C) to similar format
+                # Create spatial tokens from global features: (B, 512) -> (B, 1+576, 768) where 576=24*24
+                B = clip_features.shape[0]
+                C = clip_features.shape[1]  # 512 for RN101
+
+                # Project 512 -> 768 channels if needed
+                if C != self.proj_dim:
+                    # Create a simple projection layer on-the-fly or use linear projection
+                    # For now, pad with zeros to reach 768 channels
+                    padding = torch.zeros(B, self.proj_dim - C, device=clip_features.device, dtype=clip_features.dtype)
+                    clip_features_padded = torch.cat([clip_features, padding], dim=1)  # (B, 768)
+                else:
+                    clip_features_padded = clip_features
+
+                # For spatial features at 24x24, we need 576 patch tokens + 1 CLS token
+                clip_image_features = clip_features_padded.unsqueeze(1)  # (B, 1, 512) - CLS token
+                # Create pseudo-spatial tokens by expanding the global feature
+                spatial_tokens = clip_image_features.expand(B, 24*24, self.proj_dim)  # (B, 576, 512)
+                clip_features = torch.cat([clip_image_features, spatial_tokens], dim=1)  # (B, 577, 512)
+
+                # For consistency with ViT path, create res3 from final features
+                # Expand global feature to 24x24 spatial to match expected dimensions
+                res3 = clip_image_features.squeeze(1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 24, 24)
+
+                # Process intermediate layer features
+                # 1. Interpolate to target spatial size (24x24)
+                res4 = F.interpolate(res4_resnet, size=(24, 24), mode='bilinear', align_corners=False)
+                res5 = F.interpolate(res5_resnet, size=(24, 24), mode='bilinear', align_corners=False)
+
+                # 2. Project to expected channel dimensions (768 channels)
+                res4 = self.resnet_layer2_proj(res4) if self.resnet_layer2_proj is not None else res4
+                res5 = self.resnet_layer3_proj(res5) if self.resnet_layer3_proj is not None else res5
+
+                # 3. Apply upsample layers to match decoder expectations
+                res4 = self.upsample1(res4) if self.upsample1 is not None else None
+                res5 = self.upsample2(res5) if self.upsample2 is not None else None
+            else:
+                # For ViT: features are patch tokens that need reshaping
+                clip_image_features = clip_features[:, 1:, :]
+                res3 = rearrange(clip_image_features, "B (H W) C -> B C H W", H=24)
+                res4 = rearrange(self.layers[0][1:, :, :], "(H W) B C -> B C H W", H=24)
+                res5 = rearrange(self.layers[1][1:, :, :], "(H W) B C -> B C H W", H=24)
+                res4 = self.upsample1(res4) if self.upsample1 is not None else None
+                res5 = self.upsample2(res5) if self.upsample2 is not None else None
 
             clip_features_guidance = {'res5': res5, 'res4': res4, 'res3': res3,}
         else:
