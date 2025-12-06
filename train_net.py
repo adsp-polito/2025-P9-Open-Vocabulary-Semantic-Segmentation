@@ -70,11 +70,6 @@ device = torch.device(torch_backend)
 
 print(f"Using device: {device}")
 
-
-print("PYTHON VERSION:", sys.version)
-print("PYTHON EXECUTABLE:", sys.executable)
-
-
 class VOCbEvaluator(SemSegEvaluator):
     """
     Evaluate semantic segmentation metrics.

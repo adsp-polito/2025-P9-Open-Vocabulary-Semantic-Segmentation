@@ -105,7 +105,8 @@ class GSNetPredictor(nn.Module):
         else:
             # for OpenAI models
             clip_model, clip_preprocess = clip.load(clip_pretrained, device=device, jit=False, prompt_depth=prompt_depth, prompt_length=prompt_length)
-    
+            print(f"[GSNet] Loaded CLIP model: {clip_pretrained}")
+
         self.prompt_ensemble_type = prompt_ensemble_type        
 
         if self.prompt_ensemble_type == "imagenet_select":
