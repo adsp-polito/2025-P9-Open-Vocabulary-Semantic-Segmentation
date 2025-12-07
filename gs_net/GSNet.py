@@ -163,11 +163,15 @@ class GSNet(nn.Module):
         self.is_resnet = clip_pretrained in ["RN50", "RN101", "RN50x4", "RN50x16", "RN50x64"]
 
         # For ResNet, we need projection layers to match channel dimensions
-        # RN101: layer2=512ch, layer3=1024ch -> need to project to match expected dims
+        # RN101 layer structure: layer1=256ch, layer2=512ch, layer3=1024ch, layer4=2048ch
         if self.is_resnet:
             # Project ResNet features to match expected dimensions
-            self.resnet_layer2_proj = nn.Conv2d(512, self.proj_dim, kernel_size=1) if self.use_clip else None
-            self.resnet_layer3_proj = nn.Conv2d(1024, self.proj_dim, kernel_size=1) if self.use_clip else None
+            # SOLUTION 1 FIX: Added layer4 projection to restore spatial uniqueness in res3
+            # Previously, res3 used expanded global features (all identical across spatial locations)
+            # Now, res3 uses layer4 spatial features (unique per location) for proper correlation
+            self.resnet_layer4_proj = nn.Conv2d(2048, self.proj_dim, kernel_size=1) if self.use_clip else None  # NEW: for res3
+            self.resnet_layer2_proj = nn.Conv2d(512, self.proj_dim, kernel_size=1) if self.use_clip else None   # for res4
+            self.resnet_layer3_proj = nn.Conv2d(1024, self.proj_dim, kernel_size=1) if self.use_clip else None  # for res5
             self.upsample1 = nn.ConvTranspose2d(self.proj_dim, 256, kernel_size=2, stride=2) if self.use_clip and self.clip_decod_dim[0]!=0 else None
             self.upsample2 = nn.ConvTranspose2d(self.proj_dim, 128, kernel_size=4, stride=4) if self.use_clip and self.clip_decod_dim[1]!=0 else None
         else:
@@ -179,12 +183,11 @@ class GSNet(nn.Module):
         
         self.dino_decod_proj1 = nn.Conv2d(in_channels = 768, out_channels=256, kernel_size=1, stride=1, padding=0) if self.dino_model and self.dino_decod_dim[0]!=0 else None
         self.dino_decod_proj2 = nn.ConvTranspose2d(in_channels= 768, out_channels=128, kernel_size=2, stride=2) if self.dino_model and self.dino_decod_dim[0]!=0 else None
-        
+
         self.dino_down_sample = nn.Conv2d(in_channels=768, out_channels=512, kernel_size=2, stride=2, padding=0) if self.dino_model else None
 
-        # Determine if using Vision Transformer or ResNet backbone
-        self.is_resnet = clip_pretrained in ["RN50", "RN101", "RN50x4", "RN50x16", "RN50x64"]
-
+        # Register forward hooks for intermediate features
+        # Note: self.is_resnet already set at line 163
         if not self.is_resnet:
             # For ViT models, use transformer block hooks
             self.layer_indexes = [3, 7] if clip_pretrained == "ViT-B/16" or clip_pretrained == "RemoteCLIP-ViT-B-32" else [7, 15]
@@ -194,11 +197,22 @@ class GSNet(nn.Module):
                     self.sem_seg_head.predictor.clip_model.visual.transformer.resblocks[l].register_forward_hook(lambda m, _, o: self.layers.append(o))
         else:
             # For ResNet models, use layer hooks instead
+            # Note: ResNet features are CNN-based (local receptive fields) vs ViT features which are
+            # attention-based (global receptive fields). This architectural difference is acceptable:
+            # - ResNet excels at capturing local patterns and sharp boundaries
+            # - DINOv3 provides complementary global/transformer-based features
+            # - The decoder can adapt to work with both feature types
             self.layers = []
             if self.use_clip:
-                # Hook into layer2 and layer3 for intermediate features
+                # SOLUTION 1 FIX: Hook layer2, layer3, AND layer4 for spatial features
+                # layer4 (2048ch, 7×7) → used for res3 (main spatial feature with unique locations)
+                # layer2 (512ch, 28×28) → used for res4 (decoder guidance)
+                # layer3 (1024ch, 14×14) → used for res5 (decoder guidance)
+                # Why layer4? It's the deepest spatial layer before attnpool collapses to 1×1,
+                # providing the most semantic features while maintaining spatial structure
                 self.sem_seg_head.predictor.clip_model.visual.layer2.register_forward_hook(lambda m, _, o: self.layers.append(o))
                 self.sem_seg_head.predictor.clip_model.visual.layer3.register_forward_hook(lambda m, _, o: self.layers.append(o))
+                self.sem_seg_head.predictor.clip_model.visual.layer4.register_forward_hook(lambda m, _, o: self.layers.append(o))  # NEW!
 
 
     @classmethod
@@ -335,48 +349,67 @@ class GSNet(nn.Module):
             clip_features = self.sem_seg_head.predictor.clip_model.encode_image(clip_images_resized, dense=True)
 
             if self.is_resnet:
-                # For ResNet: features are already in spatial format (B, C, H, W)
-                # self.layers[0] is layer2 output (512 channels), self.layers[1] is layer3 output (1024 channels)
-                res4_resnet = self.layers[0]  # layer2 features: (B, 512, H, W)
-                res5_resnet = self.layers[1]  # layer3 features: (B, 1024, H, W)
+                # ============================================================================
+                # SOLUTION 1 FIX: Use layer4 spatial features for res3
+                # ============================================================================
+                # PROBLEM (old code): res3 was created by expanding global features, making
+                # all 576 spatial locations identical. This broke spatial reasoning in the
+                # correlation module - every location had the same text-image similarity!
+                #
+                # SOLUTION: Use layer4 (deepest spatial layer) for res3 instead of global.
+                # This provides unique features per spatial location, enabling proper
+                # spatial discrimination in correlation and attention mechanisms.
+                # ============================================================================
 
-                # ResNet output from attnpool is (B, 512) - need to reshape to match ViT format
-                # ViT outputs (B, num_patches+1, C), so we need to convert ResNet (B, C) to similar format
-                # Create spatial tokens from global features: (B, 512) -> (B, 1+576, 768) where 576=24*24
-                B = clip_features.shape[0]
-                C = clip_features.shape[1]  # 512 for RN101
+                # Extract hooked features from ResNet layers
+                # self.layers[0] = layer2 (512ch, ~28×28) → for res4 (decoder guidance)
+                # self.layers[1] = layer3 (1024ch, ~14×14) → for res5 (decoder guidance)
+                # self.layers[2] = layer4 (2048ch, ~7×7) → for res3 (main spatial feature) ← NEW!
+                layer2_resnet = self.layers[0]  # (B, 512, H, W)
+                layer3_resnet = self.layers[1]  # (B, 1024, H, W)
+                layer4_resnet = self.layers[2]  # (B, 2048, H, W) ← NEW!
 
-                # Project 512 -> 768 channels if needed
-                if C != self.proj_dim:
-                    # Create a simple projection layer on-the-fly or use linear projection
-                    # For now, pad with zeros to reach 768 channels
-                    padding = torch.zeros(B, self.proj_dim - C, device=clip_features.device, dtype=clip_features.dtype)
-                    clip_features_padded = torch.cat([clip_features, padding], dim=1)  # (B, 768)
-                else:
-                    clip_features_padded = clip_features
+                # ============================================================================
+                # Create res3 from layer4 spatial features (FIXED VERSION)
+                # ============================================================================
+                # Interpolate layer4 to 24×24 and project to 512 channels
+                # This gives us UNIQUE features per spatial location (not all identical!)
+                res3_temp = F.interpolate(layer4_resnet, size=(24, 24), mode='bilinear', align_corners=False)  # (B, 2048, 24, 24)
+                res3 = self.resnet_layer4_proj(res3_temp)  # (B, 512, 24, 24) with UNIQUE spatial features ✓
 
-                # For spatial features at 24x24, we need 576 patch tokens + 1 CLS token
-                clip_image_features = clip_features_padded.unsqueeze(1)  # (B, 1, 512) - CLS token
-                # Create pseudo-spatial tokens by expanding the global feature
-                spatial_tokens = clip_image_features.expand(B, 24*24, self.proj_dim)  # (B, 576, 512)
-                clip_features = torch.cat([clip_image_features, spatial_tokens], dim=1)  # (B, 577, 512)
+                # Create proper token sequence for head: CLS token + spatial tokens from res3
+                clip_image_features = rearrange(res3, "B C H W -> B (H W) C")  # (B, 576, 512) - each location unique!
+                cls_token = clip_features.unsqueeze(1)  # (B, 1, 512) - global feature from attnpool
+                clip_features = torch.cat([cls_token, clip_image_features], dim=1)  # (B, 577, 512)
 
-                # For consistency with ViT path, create res3 from final features
-                # Expand global feature to 24x24 spatial to match expected dimensions
-                res3 = clip_image_features.squeeze(1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 24, 24)
+                # ============================================================================
+                # OLD CODE (COMMENTED FOR REFERENCE - DO NOT DELETE)
+                # ============================================================================
+                # This was the problematic code that created identical spatial tokens:
+                #
+                # clip_image_features = clip_features.unsqueeze(1)  # (B, 1, 512) - ONE global feature
+                # spatial_tokens = clip_image_features.expand(B, 24*24, self.proj_dim)  # Copy 576 times ← PROBLEM!
+                # clip_features = torch.cat([clip_image_features, spatial_tokens], dim=1)  # All identical!
+                # res3 = clip_image_features.squeeze(1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 24, 24)
+                #
+                # Why this was wrong:
+                # - spatial_tokens[:, 0, :] == spatial_tokens[:, 575, :] (all identical)
+                # - Correlation module got same value at every spatial location
+                # - No spatial discrimination possible!
+                # ============================================================================
 
-                # Process intermediate layer features
-                # 1. Interpolate to target spatial size (24x24)
-                res4 = F.interpolate(res4_resnet, size=(24, 24), mode='bilinear', align_corners=False)
-                res5 = F.interpolate(res5_resnet, size=(24, 24), mode='bilinear', align_corners=False)
+                # Process decoder guidance features (res4, res5) - unchanged from before
+                # 1. Interpolate to target spatial size (24×24)
+                res4 = F.interpolate(layer2_resnet, size=(24, 24), mode='bilinear', align_corners=False)
+                res5 = F.interpolate(layer3_resnet, size=(24, 24), mode='bilinear', align_corners=False)
 
-                # 2. Project to expected channel dimensions (768 channels)
+                # 2. Project to expected channel dimensions (proj_dim: 512 for RN101, 768 for ViT-B, etc.)
                 res4 = self.resnet_layer2_proj(res4) if self.resnet_layer2_proj is not None else res4
                 res5 = self.resnet_layer3_proj(res5) if self.resnet_layer3_proj is not None else res5
 
                 # 3. Apply upsample layers to match decoder expectations
-                res4 = self.upsample1(res4) if self.upsample1 is not None else None
-                res5 = self.upsample2(res5) if self.upsample2 is not None else None
+                res4 = self.upsample1(res4) if self.upsample1 is not None else None  # (B, 256, 48, 48)
+                res5 = self.upsample2(res5) if self.upsample2 is not None else None  # (B, 128, 96, 96)
             else:
                 # For ViT: features are patch tokens that need reshaping
                 clip_image_features = clip_features[:, 1:, :]
