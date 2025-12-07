@@ -207,7 +207,7 @@ class GSNet(nn.Module):
         sem_seg_head = build_sem_seg_head(cfg, None)
         if cfg.MODEL.SEM_SEG_HEAD.USE_DINO_CORR:
             # Use environment variable if set, otherwise use default path
-            rsib_ckpt = os.getenv('RSIB_CKPT', './RSIB.pth')
+            rsib_ckpt = os.getenv('RSIB_CKPT', './dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth')
             dino = BuildRSIB(rsib_ckpt)
             dino_ft = cfg.MODEL.SEM_SEG_HEAD.DINO_FINETUNE
             for name, params in dino.named_parameters():
