@@ -79,8 +79,8 @@ $DETECTRON2_DATASETS
 An example of installation is shown below:
 
 ```
-git clone https://github.com/yecy749/GSNet.git
-cd GSNet
+https://github.com/adsp-polito/2025-P9-Open-Vocabulary-Semantic-Segmentation.git
+cd 2025-P9-Open-Vocabulary-Semantic-Segmentation
 conda create -n gsnet python=3.8
 conda activate gsnet
 conda install pytorch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 pytorch-cuda=11.8 -c pytorch -c nvidia
