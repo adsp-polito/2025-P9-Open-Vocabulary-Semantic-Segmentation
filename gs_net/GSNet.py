@@ -184,7 +184,7 @@ class GSNet(nn.Module):
         self.dino_decod_proj1 = nn.Conv2d(in_channels = 768, out_channels=256, kernel_size=1, stride=1, padding=0) if self.dino_model and self.dino_decod_dim[0]!=0 else None
         self.dino_decod_proj2 = nn.ConvTranspose2d(in_channels= 768, out_channels=128, kernel_size=2, stride=2) if self.dino_model and self.dino_decod_dim[0]!=0 else None
 
-        self.dino_down_sample = nn.Conv2d(in_channels=768, out_channels=512, kernel_size=2, stride=2, padding=0) if self.dino_model else None
+        self.dino_down_sample = nn.Conv2d(in_channels=768, out_channels=self.proj_dim, kernel_size=2, stride=2, padding=0) if self.dino_model else None
 
         # Register forward hooks for intermediate features
         # Note: self.is_resnet already set at line 163
