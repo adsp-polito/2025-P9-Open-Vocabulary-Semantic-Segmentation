@@ -23,7 +23,7 @@ def _get_landdiscover50k_meta():
     return ret
 
 def register_landdiscover50k(root):
-    root = os.path.join(root, "LandDiscover50K")
+    root = os.path.join(root, "LandDiscover_50K")
     meta = _get_landdiscover50k_meta()
     # for name, image_dirname, sem_seg_dirname in [
     #     ("test", "images/validation", "annotations_detectron2/validation"),
