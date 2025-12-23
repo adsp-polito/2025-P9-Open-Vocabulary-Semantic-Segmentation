@@ -67,7 +67,45 @@ class AttentionPool2d(nn.Module):
     def forward(self, x):
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+
+        # CRITICAL FIX: Interpolate positional embeddings if resolution changes
+        # Problem: pos_embed is fixed for 224×224 (50 tokens), but 384×384 needs 145 tokens
+        # Solution: Interpolate pos_embed to match current resolution
+        pos_embed = self.positional_embedding[:, None, :].to(x.dtype)
+
+        if x.shape[0] != pos_embed.shape[0]:
+            # Size mismatch detected - need to interpolate
+            # pos_embed shape: (expected_HW+1, 1, C)
+            # x shape: (actual_HW+1, N, C)
+
+            # Separate CLS token and spatial tokens
+            cls_pos = pos_embed[:1]  # (1, 1, C)
+            spatial_pos = pos_embed[1:]  # (expected_HW, 1, C)
+
+            # Calculate grid sizes
+            expected_hw = spatial_pos.shape[0]
+            actual_hw = x.shape[0] - 1
+            expected_size = int(expected_hw ** 0.5)
+            actual_size = int(actual_hw ** 0.5)
+
+            # Reshape spatial pos_embed to 2D grid
+            spatial_pos = spatial_pos.reshape(expected_size, expected_size, -1).permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+
+            # Interpolate to new size
+            spatial_pos = torch.nn.functional.interpolate(
+                spatial_pos,
+                size=(actual_size, actual_size),
+                mode='bicubic',
+                align_corners=False
+            )
+
+            # Reshape back to sequence
+            spatial_pos = spatial_pos.squeeze(0).permute(1, 2, 0).reshape(actual_hw, 1, -1)  # (actual_HW, 1, C)
+
+            # Concatenate CLS and interpolated spatial embeddings
+            pos_embed = torch.cat([cls_pos, spatial_pos], dim=0)
+
+        x = x + pos_embed  # (HW+1)NC
         x, _ = F.multi_head_attention_forward(
             query=x[:1], key=x, value=x,
             embed_dim_to_check=x.shape[-1],
