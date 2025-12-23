@@ -49,7 +49,7 @@ python3 train_net.py --config $config \
  MODEL.SEM_SEG_HEAD.NUM_CLASSES 40 \
  MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON "datasets/landdiscover.json" \
  MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/floodnet.json" \
- TEST.EVAL_PERIOD 5000 \
+ TEST.EVAL_PERIOD 0 \
  DATASETS.TRAIN \(\"LandDiscover_50K\"\,\) \
  DATASETS.TEST \(\"FloodNet\"\,\) \
  $opts
