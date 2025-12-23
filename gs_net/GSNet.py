@@ -141,7 +141,13 @@ class GSNet(nn.Module):
         elif clip_pretrained == "RemoteCLIP-ViT-B-32":
             self.clip_resolution = (768,768)
         elif clip_pretrained == "RN101" or clip_pretrained == "RN50":
-            self.clip_resolution = (224, 224)
+            # SOLUTION: Increase ResNet resolution from 224 to 384 to match DINOv3
+            # Trade-off: Slightly different from CLIP pretraining (224), but better feature alignment
+            # CLIP ResNet was pretrained at 224×224, but can handle 384×384 with interpolated pos encoding
+            self.clip_resolution = (384, 384)  # Changed from (224, 224)
+            print(f"[CLIP ResNet] Using 384×384 resolution (instead of pretrain 224×224)")
+            print(f"  → Better alignment with DINOv3 and input images")
+            print(f"  → May have slight domain shift from pretraining")
         else:
             self.clip_resolution = (336, 336)
         self.dino_resolution = (384,384)
@@ -174,13 +180,60 @@ class GSNet(nn.Module):
             self.resnet_layer3_proj = nn.Conv2d(1024, self.proj_dim, kernel_size=1) if self.use_clip else None  # for res5
             self.upsample1 = nn.ConvTranspose2d(self.proj_dim, 256, kernel_size=2, stride=2) if self.use_clip and self.clip_decod_dim[0]!=0 else None
             self.upsample2 = nn.ConvTranspose2d(self.proj_dim, 128, kernel_size=4, stride=4) if self.use_clip and self.clip_decod_dim[1]!=0 else None
+
+            # CRITICAL FIX: Smart initialization for ResNet projection layers
+            # Problem: Random init destroys pretrained ResNet features
+            # Solution: Use small weights to preserve features while allowing learning
+            if self.use_clip:
+                print(f"\n[CLIP ResNet] Initializing projection layers with feature-preserving weights:")
+
+                # Layer4 projection: 2048 → proj_dim (512 for RN101)
+                # Use smaller weights since we're downsampling 4x
+                if self.resnet_layer4_proj is not None:
+                    nn.init.xavier_uniform_(self.resnet_layer4_proj.weight, gain=0.02)
+                    if self.resnet_layer4_proj.bias is not None:
+                        nn.init.zeros_(self.resnet_layer4_proj.bias)
+                    print(f"  ✓ layer4_proj: 2048→{self.proj_dim} (gain=0.02)")
+
+                # Layer2 projection: 512 → proj_dim
+                # Identity-like since input/output dims are similar
+                if self.resnet_layer2_proj is not None:
+                    if self.proj_dim == 512:
+                        # Same dims: use near-identity
+                        nn.init.eye_(self.resnet_layer2_proj.weight.squeeze())
+                        self.resnet_layer2_proj.weight.data *= 0.9
+                    else:
+                        # Different dims: use small weights
+                        nn.init.xavier_uniform_(self.resnet_layer2_proj.weight, gain=0.02)
+                    if self.resnet_layer2_proj.bias is not None:
+                        nn.init.zeros_(self.resnet_layer2_proj.bias)
+                    print(f"  ✓ layer2_proj: 512→{self.proj_dim} ({'identity' if self.proj_dim == 512 else 'gain=0.02'})")
+
+                # Layer3 projection: 1024 → proj_dim
+                if self.resnet_layer3_proj is not None:
+                    nn.init.xavier_uniform_(self.resnet_layer3_proj.weight, gain=0.02)
+                    if self.resnet_layer3_proj.bias is not None:
+                        nn.init.zeros_(self.resnet_layer3_proj.bias)
+                    print(f"  ✓ layer3_proj: 1024→{self.proj_dim} (gain=0.02)")
+
+                print(f"  → All projections are TRAINABLE and will adapt during training")
+
+                # SOLUTION: Add feature normalization for CNN→Decoder compatibility
+                # Problem: ResNet features have different statistics than ViT features
+                # - ResNet: local, sparse activations (ReLU-based)
+                # - ViT: global, dense activations (GELU-based)
+                # Solution: LayerNorm to standardize feature distributions
+                print(f"\n[Architecture Bridge] Adding normalization for CNN→Transformer decoder:")
+                self.clip_feature_norm = nn.LayerNorm(self.proj_dim)
+                print(f"  ✓ LayerNorm({self.proj_dim}) - normalizes ResNet features to match decoder expectations")
         else:
             # For ViT, use standard upsample layers
             self.resnet_layer2_proj = None
             self.resnet_layer3_proj = None
+            self.clip_feature_norm = None  # ViT doesn't need this
             self.upsample1 = nn.ConvTranspose2d(self.proj_dim, 256, kernel_size=2, stride=2) if self.use_clip and self.clip_decod_dim[0]!=0 else None
             self.upsample2 = nn.ConvTranspose2d(self.proj_dim, 128, kernel_size=4, stride=4) if self.use_clip and self.clip_decod_dim[1]!=0 else None
-        
+
         self.dino_decod_proj1 = nn.Conv2d(in_channels = 768, out_channels=256, kernel_size=1, stride=1, padding=0) if self.dino_model and self.dino_decod_dim[0]!=0 else None
         self.dino_decod_proj2 = nn.ConvTranspose2d(in_channels= 768, out_channels=128, kernel_size=2, stride=2) if self.dino_model and self.dino_decod_dim[0]!=0 else None
 
@@ -226,7 +279,7 @@ class GSNet(nn.Module):
             dino_ft = cfg.MODEL.SEM_SEG_HEAD.DINO_FINETUNE
             for name, params in dino.named_parameters():
                 if dino_ft == "attention":
-                    
+
                     if "attn.qkv.weight" in name:
                         params.requires_grad = True
                     elif "pos_embed" in name:
@@ -236,7 +289,12 @@ class GSNet(nn.Module):
                 elif dino_ft == "full":
                     params.requires_grad = True
                 else:
-                    params.requires_grad = False
+                    # CRITICAL FIX: Always keep dim_projection trainable even when freezing backbone
+                    if "dim_projection" in name:
+                        params.requires_grad = True
+                        print(f"[DINOv3] Keeping projection layer trainable: {name}")
+                    else:
+                        params.requires_grad = False
 
         else:
             dino = None
@@ -377,9 +435,31 @@ class GSNet(nn.Module):
                 res3_temp = F.interpolate(layer4_resnet, size=(24, 24), mode='bilinear', align_corners=False)  # (B, 2048, 24, 24)
                 res3 = self.resnet_layer4_proj(res3_temp)  # (B, 512, 24, 24) with UNIQUE spatial features ✓
 
+                # VERIFICATION: Check spatial uniqueness (only in training, first batch)
+                if self.training and not hasattr(self, '_verified_spatial_uniqueness'):
+                    with torch.no_grad():
+                        spatial_tokens = res3.reshape(res3.shape[0], res3.shape[1], -1)  # (B, C, 576)
+                        # Check if different spatial locations have different features
+                        loc0 = spatial_tokens[:, :, 0]  # First location
+                        loc100 = spatial_tokens[:, :, 100]  # Middle location
+                        difference = (loc0 - loc100).abs().mean().item()
+                        if difference < 0.01:
+                            print(f"⚠️  WARNING: Spatial features are too similar! diff={difference:.6f}")
+                            print(f"    This suggests projection may not be working correctly")
+                        else:
+                            print(f"✓ Spatial discrimination verified: diff={difference:.4f} (good!)")
+                    self._verified_spatial_uniqueness = True
+
                 # Create proper token sequence for head: CLS token + spatial tokens from res3
                 clip_image_features = rearrange(res3, "B C H W -> B (H W) C")  # (B, 576, 512) - each location unique!
                 cls_token = clip_features.unsqueeze(1)  # (B, 1, 512) - global feature from attnpool
+
+                # SOLUTION: Apply feature normalization for CNN→Decoder compatibility
+                # Normalizes ResNet features to have similar statistics as ViT features
+                if self.clip_feature_norm is not None:
+                    clip_image_features = self.clip_feature_norm(clip_image_features)  # (B, 576, 512) - normalized
+                    cls_token = self.clip_feature_norm(cls_token)  # (B, 1, 512) - normalized
+
                 clip_features = torch.cat([cls_token, clip_image_features], dim=1)  # (B, 577, 512)
 
                 # ============================================================================

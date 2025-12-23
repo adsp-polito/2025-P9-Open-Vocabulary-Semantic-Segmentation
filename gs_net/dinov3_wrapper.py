@@ -129,9 +129,24 @@ class DINOv3Wrapper(nn.Module):
         self.model.eval()
         
         # 6. Create dimension projection: 1024 → 768
-        # Initialized with small weights (no training needed)
+        # SOLUTION: Use identity-like initialization to preserve DINOv3 features
+        # Project first 768 dims with identity, learn residual for remaining 256 dims
         self.dim_projection = nn.Linear(1024, 768, bias=False)
-        self.dim_projection.weight.data.normal_(0, 0.01)
+
+        # Initialize as: out = W @ in, where W[:768, :768] ≈ I (identity for first 768 dims)
+        # This preserves most DINOv3 info while allowing learning
+        with torch.no_grad():
+            # Start with small random weights
+            self.dim_projection.weight.data.zero_()
+            # Set first 768x768 block to identity (preserve main features)
+            self.dim_projection.weight.data[:, :768] = torch.eye(768) * 0.9
+            # Add small noise for remaining 256 dims (learn from extra capacity)
+            self.dim_projection.weight.data[:, 768:] = torch.randn(768, 256) * 0.01
+
+        print(f"\n[DINOv3 Projection] Initialized with identity-preserving weights:")
+        print(f"  - First 768 dims: 0.9×Identity (preserve features)")
+        print(f"  - Last 256 dims: Random (learn compression)")
+        print(f"  - Projection is TRAINABLE (will adapt during training)")
         
         # 7. Set up layer index mapping for 24 blocks
         # Map 12 output indices to 24 block indices (evenly spaced)
