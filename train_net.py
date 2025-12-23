@@ -1,63 +1,49 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import sys
+import os
+sys.path.insert(0, os.path.abspath('./detectron2'))
+
+
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 """
 MaskFormer Training Script.
 
 This script is a simplified version of the training script in detectron2/tools.
 """
-import sys
-import os
-sys.path.insert(0, os.path.abspath('./detectron2'))
-
 import copy
-import glob
 import itertools
-import json
 import logging
 import os
-import sys
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
-
-import detectron2.utils.comm as comm
-import numpy as np
-import pycocotools.mask as mask_util
-
 # from memory_profiler import profile
 import torch
+
+import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.data import (
-    DatasetCatalog,
-    MetadataCatalog,
-    build_detection_train_loader,
-)
-from detectron2.engine import (
-    DefaultTrainer,
-    default_argument_parser,
-    default_setup,
-    launch,
-)
-from detectron2.evaluation import (
-    CityscapesInstanceEvaluator,
-    CityscapesSemSegEvaluator,
-    COCOEvaluator,
-    COCOPanopticEvaluator,
-    DatasetEvaluator,
-    DatasetEvaluators,
-    SemSegEvaluator,
-    verify_results,
-)
+from detectron2.data import MetadataCatalog, build_detection_train_loader
+from detectron2.engine import DefaultTrainer, default_argument_parser, default_setup, launch
+from detectron2.evaluation import CityscapesInstanceEvaluator, CityscapesSemSegEvaluator, \
+    COCOEvaluator, COCOPanopticEvaluator, DatasetEvaluators, SemSegEvaluator, verify_results, \
+    DatasetEvaluator
+
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
-from detectron2.utils.comm import all_gather, is_main_process, synchronize
-from detectron2.utils.file_io import PathManager
 from detectron2.utils.logger import setup_logger
+
+from detectron2.utils.file_io import PathManager
+import numpy as np
 from PIL import Image
+import glob
+
+import pycocotools.mask as mask_util
+
+from detectron2.data import DatasetCatalog, MetadataCatalog
+from detectron2.utils.comm import all_gather, is_main_process, synchronize
+import json
 
 # from detectron2.evaluation import SemSegGzeroEvaluator
 # from mask_former.evaluation.sem_seg_evaluation_gzero import SemSegGzeroEvaluator
-
 
 # initialize torch backend
 torch_backend = "cpu"
@@ -74,7 +60,6 @@ class VOCbEvaluator(SemSegEvaluator):
     """
     Evaluate semantic segmentation metrics.
     """
-
     def process(self, inputs, outputs):
         """
         Args:
@@ -89,9 +74,7 @@ class VOCbEvaluator(SemSegEvaluator):
             output = output["sem_seg"].argmax(dim=0).to(self._cpu_device)
             pred = np.array(output, dtype=np.int)
             pred[pred >= 20] = 20
-            with PathManager.open(
-                self.input_file_to_gt_file[input["file_name"]], "rb"
-            ) as f:
+            with PathManager.open(self.input_file_to_gt_file[input["file_name"]], "rb") as f:
                 gt = np.array(Image.open(f), dtype=np.int)
 
             gt[gt == self._ignore_label] = self._num_classes
@@ -102,7 +85,6 @@ class VOCbEvaluator(SemSegEvaluator):
             ).reshape(self._conf_matrix.shape)
 
             self._predictions.extend(self.encode_json_sem_seg(pred, input["file_name"]))
-
 
 # MaskFormer
 from gs_net import (
@@ -158,19 +140,19 @@ class Trainer(DefaultTrainer):
         ]:
             evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
         if evaluator_type == "cityscapes_instance":
-            assert torch.cpu.device_count() >= comm.get_rank(), (
-                "CityscapesEvaluator currently do not work with multiple machines."
-            )
+            assert (
+                torch.cuda.device_count() >= comm.get_rank()
+            ), "CityscapesEvaluator currently do not work with multiple machines."
             return CityscapesInstanceEvaluator(dataset_name)
         if evaluator_type == "cityscapes_sem_seg":
-            assert torch.cpu.device_count() >= comm.get_rank(), (
-                "CityscapesEvaluator currently do not work with multiple machines."
-            )
+            assert (
+                torch.cuda.device_count() >= comm.get_rank()
+            ), "CityscapesEvaluator currently do not work with multiple machines."
             return CityscapesSemSegEvaluator(dataset_name)
         if evaluator_type == "cityscapes_panoptic_seg":
-            assert torch.cpu.device_count() >= comm.get_rank(), (
-                "CityscapesEvaluator currently do not work with multiple machines."
-            )
+            assert (
+                torch.cuda.device_count() >= comm.get_rank()
+            ), "CityscapesEvaluator currently do not work with multiple machines."
             evaluator_list.append(CityscapesSemSegEvaluator(dataset_name))
         if len(evaluator_list) == 0:
             raise NotImplementedError(
@@ -242,9 +224,7 @@ class Trainer(DefaultTrainer):
                 memo.add(value)
                 hyperparams = copy.copy(defaults)
                 if "backbone" in module_name:
-                    hyperparams["lr"] = (
-                        hyperparams["lr"] * cfg.SOLVER.BACKBONE_MULTIPLIER
-                    )
+                    hyperparams["lr"] = hyperparams["lr"] * cfg.SOLVER.BACKBONE_MULTIPLIER
                 if "clip_model" in module_name:
                     hyperparams["lr"] = hyperparams["lr"] * cfg.SOLVER.CLIP_MULTIPLIER
                 # for deformable detr
@@ -272,9 +252,7 @@ class Trainer(DefaultTrainer):
 
             class FullModelGradientClippingOptimizer(optim):
                 def step(self, closure=None):
-                    all_params = itertools.chain(
-                        *[x["params"] for x in self.param_groups]
-                    )
+                    all_params = itertools.chain(*[x["params"] for x in self.param_groups])
                     torch.nn.utils.clip_grad_norm_(all_params, clip_norm_val)
                     super().step(closure=closure)
 
@@ -325,35 +303,8 @@ def setup(args):
     cfg.freeze()
     default_setup(cfg, args)
     # Setup logger for "mask_former" module
-    setup_logger(
-        output=cfg.OUTPUT_DIR, distributed_rank=comm.get_rank(), name="mask_former"
-    )
+    setup_logger(output=cfg.OUTPUT_DIR, distributed_rank=comm.get_rank(), name="mask_former")
     return cfg
-
-
-def load_checkpoint_with_extraction(checkpoint_path):
-    """
-    Load checkpoint and extract the relevant state dict.
-    Handles checkpoints with nested structures (student/teacher keys).
-    """
-    if not checkpoint_path or not os.path.isfile(checkpoint_path):
-        return None
-
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-    # If checkpoint has student/teacher keys, extract the appropriate one
-    if isinstance(checkpoint, dict):
-        if "student" in checkpoint:
-            state_dict = checkpoint["student"]
-        elif "teacher" in checkpoint:
-            state_dict = checkpoint["teacher"]
-        else:
-            # Assume the whole checkpoint is the state dict
-            state_dict = checkpoint
-    else:
-        state_dict = checkpoint
-
-    return state_dict
 
 
 def main(args):
@@ -361,11 +312,9 @@ def main(args):
     torch.set_float32_matmul_precision("high")
     if args.eval_only:
         model = Trainer.build_model(cfg)
-        # Load checkpoint with custom extraction logic
-        state_dict = load_checkpoint_with_extraction(cfg.MODEL.WEIGHTS)
-        if state_dict is not None:
-            incompatible = model.load_state_dict(state_dict, strict=False)
-            print(f"Loaded checkpoint with incompatible keys: {incompatible}")
+        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+            cfg.MODEL.WEIGHTS, resume=args.resume
+        )
         res = Trainer.test(cfg, model)
         if cfg.TEST.AUG.ENABLED:
             res.update(Trainer.test_with_TTA(cfg, model))
