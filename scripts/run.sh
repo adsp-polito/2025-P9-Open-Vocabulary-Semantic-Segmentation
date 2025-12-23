@@ -7,7 +7,7 @@ RESULTS='output/floodnet_training'
 sh scripts/train.sh configs/rn101_224.yaml 1 $RESULTS \
 SOLVER.IMS_PER_BATCH 2 \
 SOLVER.MAX_ITER 30002 \
-DATALOADER.NUM_WORKERS 8 \
+DATALOADER.NUM_WORKERS 4 \
 
 sh scripts/eval.sh configs/rn101_224.yaml 1 $RESULTS \
 MODEL.WEIGHTS $RESULTS/model_final.pth
