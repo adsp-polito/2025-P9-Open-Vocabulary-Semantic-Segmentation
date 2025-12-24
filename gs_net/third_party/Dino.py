@@ -14,7 +14,7 @@ from torch.optim import AdamW
 ROOT = "../data/datasets/LandDiscover_50K"
 IMG_DIR = os.path.join(ROOT, "TR_Image")
 GT_DIR = os.path.join(ROOT, "GT_ID")
-PRETRAINED_WEIGHTS = "dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+PRETRAINED_WEIGHTS = "../../dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
 
 NUM_CLASSES = 40          # adjust if needed
 IMG_SIZE = 384
