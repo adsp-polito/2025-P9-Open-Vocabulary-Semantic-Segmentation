@@ -142,7 +142,7 @@ dataset = UnlabeledImageDataset(
 
 loader = DataLoader(
     dataset,
-    batch_size=4,  # Reduced from 32 to fit in GPU memory
+    batch_size=2,  # Reduced to 2 for memory constraints
     shuffle=True,
     num_workers=2,  # Reduced from 4 as per warning
     pin_memory=True
