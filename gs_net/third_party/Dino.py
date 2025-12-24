@@ -18,7 +18,7 @@ PRETRAINED_WEIGHTS = "../../dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m
 
 NUM_CLASSES = 40          # adjust if needed
 IMG_SIZE = 384
-BATCH_SIZE = 2            # ViT-L + segmentation is heavy
+BATCH_SIZE = 1            # ViT-L + segmentation is heavy
 EPOCHS = 50
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IGNORE_INDEX = 255        # common for segmentation
