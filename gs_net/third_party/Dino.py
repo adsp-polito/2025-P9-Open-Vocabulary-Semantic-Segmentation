@@ -11,15 +11,15 @@ from torch.optim import AdamW
 # ======================
 # CONFIG
 # ======================
-ROOT = "../data/datasets/LandDiscover50K"
+ROOT = "../data/datasets/LandDiscover_50K"
 IMG_DIR = os.path.join(ROOT, "TR_Image")
 GT_DIR = os.path.join(ROOT, "GT_ID")
-PRETRAINED_WEIGHTS = "dinov3_vitl16_pretrained.pth"
+PRETRAINED_WEIGHTS = "dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
 
-NUM_CLASSES = 50          # adjust if needed
+NUM_CLASSES = 40          # adjust if needed
 IMG_SIZE = 384
 BATCH_SIZE = 4            # ViT-L + segmentation is heavy
-EPOCHS = 40
+EPOCHS = 50
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IGNORE_INDEX = 255        # common for segmentation
 
