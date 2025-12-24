@@ -142,7 +142,7 @@ dataset = UnlabeledImageDataset(
 
 loader = DataLoader(
     dataset,
-    batch_size=2,  # Reduced to 2 for memory constraints
+    batch_size=1,  # Reduced to 2 for memory constraints
     shuffle=True,
     num_workers=2,  # Reduced from 4 as per warning
     pin_memory=True
