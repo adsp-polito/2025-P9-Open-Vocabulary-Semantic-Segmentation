@@ -65,8 +65,10 @@ def build_vit():
     model = timm.create_model(
         "vit_large_patch16_dinov3.sat493m",
         pretrained=False,
-        num_classes=0
+        num_classes=0,  # This already removes the classifier
+        dynamic_img_size=True
     )
+    # Don't call reset_classifier again, num_classes=0 already handles it
     return model
 
 
@@ -91,7 +93,11 @@ class DINOHead(nn.Module):
         )
 
     def forward(self, x):
-        x = x[:, 0]  # CLS token
+        # x is already the output features, not patch embeddings
+        # Check if we need to extract CLS token or if it's already pooled
+        if x.dim() == 3:  # Shape: [batch, num_tokens, embed_dim]
+            x = x[:, 0]  # CLS token
+        # If x.dim() == 2, it's already pooled
         x = self.mlp(x)
         return x
 
@@ -169,6 +175,13 @@ for epoch in range(epochs):
     for i, batch in enumerate(loader):
         g1 = batch["global1"].to(device)
         g2 = batch["global2"].to(device)
+
+        # Debug: print shapes on first iteration
+        if epoch == 0 and i == 0:
+            with torch.no_grad():
+                test_out = student(g1)
+                print(f"Student output shape: {test_out.shape}")
+                print(f"Input shape: {g1.shape}")
 
         s_out1 = student_head(student(g1))
         s_out2 = student_head(student(g2))
