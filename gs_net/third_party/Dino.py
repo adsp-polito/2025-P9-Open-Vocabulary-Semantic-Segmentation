@@ -76,9 +76,13 @@ teacher = copy.deepcopy(student).to(device)
 for p in teacher.parameters():
     p.requires_grad = False
 
+# Get the embedding dimension from the model
+embed_dim = student.embed_dim if hasattr(student, 'embed_dim') else student.num_features
+print(f"Model embedding dimension: {embed_dim}")
+
 # 4 - DINO projection head
 class DINOHead(nn.Module):
-    def __init__(self, in_dim=1024, out_dim=768):
+    def __init__(self, in_dim, out_dim=768):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, 4096),
@@ -90,8 +94,8 @@ class DINOHead(nn.Module):
         x = x[:, 0]  # CLS token
         x = self.mlp(x)
         return x
-    
-student_head = DINOHead().to(device)
+
+student_head = DINOHead(in_dim=embed_dim).to(device)
 teacher_head = copy.deepcopy(student_head).to(device)
 
 for p in teacher_head.parameters():
