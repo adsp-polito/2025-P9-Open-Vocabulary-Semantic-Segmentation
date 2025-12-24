@@ -86,7 +86,8 @@ backbone = timm.create_model(
     "vit_large_patch16_dinov3.sat493m",
     pretrained=False,
     num_classes=0,
-    dynamic_img_size=False
+    dynamic_img_size=True,
+    img_size=IMG_SIZE
 ).to(DEVICE)
 
 ckpt = torch.load(PRETRAINED_WEIGHTS, map_location="cpu")
