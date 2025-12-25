@@ -120,10 +120,21 @@ class ViTSegHead(nn.Module):
             # This shouldn't happen with num_classes=0, but handle it
             raise ValueError(f"Unexpected 2D output from backbone: {x.shape}")
 
-        # x: [B, N, C]
+        # x: [B, N, C] where N = 1 (CLS) + num_registers + H*W (patches)
         B, N, C = x.shape
-        x = x[:, 1:, :]  # remove CLS token
-        N_patches = x.shape[1]  # Number of patch tokens
+
+        # Calculate expected number of spatial patches
+        # For 384x384 with patch_size=16: (384/16)^2 = 576
+        expected_patches = (384 // 16) ** 2
+
+        # Determine number of special tokens (CLS + registers)
+        # Total tokens = CLS + registers + spatial patches
+        num_special_tokens = N - expected_patches
+
+        # Extract only the spatial patch tokens (skip CLS and register tokens)
+        x = x[:, num_special_tokens:, :]
+
+        N_patches = x.shape[1]
         H = W = int(N_patches ** 0.5)
 
         # Verify we have a perfect square
