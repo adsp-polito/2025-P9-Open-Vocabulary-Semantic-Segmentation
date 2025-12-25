@@ -123,7 +123,13 @@ class ViTSegHead(nn.Module):
         # x: [B, N, C]
         B, N, C = x.shape
         x = x[:, 1:, :]  # remove CLS token
-        H = W = int(x.shape[1] ** 0.5)
+        N_patches = x.shape[1]  # Number of patch tokens
+        H = W = int(N_patches ** 0.5)
+
+        # Verify we have a perfect square
+        if H * W != N_patches:
+            raise ValueError(f"Number of patches {N_patches} is not a perfect square. Got {H}x{W}={H*W}")
+
         x = x.transpose(1, 2).reshape(B, C, H, W)
         return self.conv(x)
 
@@ -153,11 +159,17 @@ for epoch in range(EPOCHS):
 
     total_loss = 0.0
 
-    for imgs, gts in loader:
+    for i, (imgs, gts) in enumerate(loader):
         imgs = imgs.to(DEVICE)
         gts = gts.to(DEVICE)
 
         feats = backbone.forward_features(imgs)  # [B, N, C] - get patch tokens
+
+        # Debug print for first batch
+        if i == 0:
+            print(f"Debug: feats shape = {feats.shape}")
+            print(f"Debug: expected patches = {(IMG_SIZE // 16) ** 2} + 1 CLS = {(IMG_SIZE // 16) ** 2 + 1}")
+
         logits = seg_head(feats)             # [B, C, H, W]
 
         logits = nn.functional.interpolate(
