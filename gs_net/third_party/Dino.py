@@ -114,6 +114,12 @@ class ViTSegHead(nn.Module):
         self.conv = nn.Conv2d(embed_dim, num_classes, kernel_size=1)
 
     def forward(self, x):
+        # Handle both 2D [B, C] and 3D [B, N, C] outputs
+        if len(x.shape) == 2:
+            # [B, C] -> need to get spatial features differently
+            # This shouldn't happen with num_classes=0, but handle it
+            raise ValueError(f"Unexpected 2D output from backbone: {x.shape}")
+
         # x: [B, N, C]
         B, N, C = x.shape
         x = x[:, 1:, :]  # remove CLS token
@@ -151,7 +157,7 @@ for epoch in range(EPOCHS):
         imgs = imgs.to(DEVICE)
         gts = gts.to(DEVICE)
 
-        feats = backbone(imgs)               # [B, N, C]
+        feats = backbone.forward_features(imgs)  # [B, N, C] - get patch tokens
         logits = seg_head(feats)             # [B, C, H, W]
 
         logits = nn.functional.interpolate(
