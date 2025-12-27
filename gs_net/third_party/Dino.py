@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
+from tqdm import tqdm
 
 # ======================
 # CONFIG
@@ -170,15 +171,18 @@ for epoch in range(EPOCHS):
 
     total_loss = 0.0
 
-    for i, (imgs, gts) in enumerate(loader):
+    # Progress bar for batches
+    pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+
+    for i, (imgs, gts) in enumerate(pbar):
         imgs = imgs.to(DEVICE)
         gts = gts.to(DEVICE)
 
         feats = backbone.forward_features(imgs)  # [B, N, C] - get patch tokens
 
-        # Debug print for first batch
-        if i == 0:
-            print(f"Debug: feats shape = {feats.shape}")
+        # Debug print for first batch of first epoch
+        if epoch == 0 and i == 0:
+            print(f"\nDebug: feats shape = {feats.shape}")
             print(f"Debug: expected patches = {(IMG_SIZE // 16) ** 2} + 1 CLS = {(IMG_SIZE // 16) ** 2 + 1}")
 
         logits = seg_head(feats)             # [B, C, H, W]
@@ -195,8 +199,11 @@ for epoch in range(EPOCHS):
 
         total_loss += loss.item()
 
+        # Update progress bar with current losss
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
     avg_loss = total_loss / len(loader)
-    print(f"Epoch [{epoch+1}/{EPOCHS}] | Loss: {avg_loss:.4f}")
+    print(f"Epoch [{epoch+1}/{EPOCHS}] | Avg Loss: {avg_loss:.4f}")
 
     if (epoch + 1) % 10 == 0:
         torch.save(
@@ -209,4 +216,15 @@ for epoch in range(EPOCHS):
             f"finetune_landdiscover_seg_epoch_{epoch+1}.pth"
         )
 
-print("✅ Fine-tuning completed.")
+# Save final model
+print("💾 Saving final fine-tuned weights...")
+torch.save(
+    {
+        "epoch": EPOCHS - 1,
+        "backbone": backbone.state_dict(),
+        "seg_head": seg_head.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    },
+    "finetune_landdiscover_seg_final.pth"
+)
+print("✅ Fine-tuning completed. Final weights saved to 'finetune_landdiscover_seg_final.pth'")
