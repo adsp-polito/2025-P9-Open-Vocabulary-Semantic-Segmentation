@@ -216,8 +216,10 @@ for epoch in range(EPOCHS):
             f"finetune_landdiscover_seg_epoch_{epoch+1}.pth"
         )
 
-# Save final model
+# Save final model (two versions)
 print("💾 Saving final fine-tuned weights...")
+
+# 1. Save complete checkpoint (for resuming training)
 torch.save(
     {
         "epoch": EPOCHS - 1,
@@ -227,4 +229,12 @@ torch.save(
     },
     "finetune_landdiscover_seg_final.pth"
 )
-print("✅ Fine-tuning completed. Final weights saved to 'finetune_landdiscover_seg_final.pth'")
+
+# 2. Save ONLY backbone in wrapper-compatible format (for replacing in dinov3 folder)
+# This matches the format that DINOv3Wrapper._extract_state_dict() expects
+torch.save(backbone.state_dict(), "dinov3_finetuned_backbone_only.pth")
+
+print("✅ Fine-tuning completed!")
+print("   - Full checkpoint: 'finetune_landdiscover_seg_final.pth'")
+print("   - Backbone only (wrapper-compatible): 'dinov3_finetuned_backbone_only.pth'")
+print("   → Replace 'dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth' with 'dinov3_finetuned_backbone_only.pth'")
