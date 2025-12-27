@@ -205,7 +205,7 @@ for epoch in range(EPOCHS):
     avg_loss = total_loss / len(loader)
     print(f"Epoch [{epoch+1}/{EPOCHS}] | Avg Loss: {avg_loss:.4f}")
 
-    if (epoch + 1) % 10 == 0:
+    if (epoch + 1) % 5 == 0:
         torch.save(
             {
                 "epoch": epoch,
