@@ -16,13 +16,13 @@ ROOT = "../data/datasets/LandDiscover_50K"
 IMG_DIR = os.path.join(ROOT, "TR_Image")
 GT_DIR = os.path.join(ROOT, "GT_ID")
 # PRETRAINED_WEIGHTS = "../../dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
-PRETRAINED_WEIGHTS = "./finetune_landdiscover_seg_epoch_5.pth"
+PRETRAINED_WEIGHTS = "./finetune_landdiscover_seg_epoch_10.pth"
 
 NUM_CLASSES = 40          # adjust if needed
 IMG_SIZE = 384
 BATCH_SIZE = 1            # ViT-L + segmentation is heavy
-EPOCHS = 5                # Continue for 5 more epochs (6-10)
-START_EPOCH = 5           # Starting from epoch 5
+EPOCHS = 5                # Continue for 5 more epochs (11-15)
+START_EPOCH = 10          # Starting from epoch 10
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IGNORE_INDEX = 255        # common for segmentation
 
