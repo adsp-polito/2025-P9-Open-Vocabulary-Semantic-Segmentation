@@ -90,11 +90,18 @@ class DINOv3Wrapper(nn.Module):
                 f"Checkpoint not found at {self.checkpoint_path}. "
                 f"Please verify the path exists."
             )
-        
+
         checkpoint = torch.load(self.checkpoint_path, map_location='cpu', weights_only=False)
-        
+
         # 3. Handle different checkpoint formats
         state_dict = self._extract_state_dict(checkpoint)
+
+        # Clear checkpoint from memory to save RAM
+        del checkpoint
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # 4. Load with flexible key matching
         print(f"Loading state dict into model...")
