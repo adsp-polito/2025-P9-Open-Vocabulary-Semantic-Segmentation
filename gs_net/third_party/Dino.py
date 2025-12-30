@@ -21,8 +21,9 @@ PRETRAINED_WEIGHTS = "./finetune_landdiscover_seg_epoch_15.pth"
 NUM_CLASSES = 40          # adjust if needed
 IMG_SIZE = 384
 BATCH_SIZE = 1            # ViT-L + segmentation is heavy
-EPOCHS = 5                # Continue for 5 more epochs (16-20)
-START_EPOCH = 15          # Starting from epoch 10
+EPOCHS = 5                # Stage 2: epochs 16-20
+START_EPOCH = 15          # Starting from epoch 15
+NUM_UNFROZEN_BLOCKS = 4   # Unfreeze last 4 blocks (stage 2)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IGNORE_INDEX = 255        # common for segmentation
 
@@ -107,10 +108,16 @@ else:
 for p in backbone.parameters():
     p.requires_grad = False
 
-# Unfreeze last 2 ViT blocks (~8–10%)
-for block in backbone.blocks[-2:]:
+# Unfreeze last N ViT blocks (gradual unfreezing)
+print(f"Unfreezing last {NUM_UNFROZEN_BLOCKS} blocks (blocks {24 - NUM_UNFROZEN_BLOCKS} to 23)...")
+for block in backbone.blocks[-NUM_UNFROZEN_BLOCKS:]:
     for p in block.parameters():
         p.requires_grad = True
+
+# Count trainable parameters
+total_params = sum(p.numel() for p in backbone.parameters())
+trainable_params = sum(p.numel() for p in backbone.parameters() if p.requires_grad)
+print(f"Backbone parameters: {trainable_params:,} / {total_params:,} trainable ({100*trainable_params/total_params:.1f}%)")
 
 # ======================
 # SEGMENTATION HEAD
@@ -156,10 +163,35 @@ seg_head = ViTSegHead(backbone.num_features, NUM_CLASSES).to(DEVICE)
 # ======================
 # OPTIMIZER & LOSS
 # ======================
+# Learning rate schedule for gradual unfreezing
+# Stage 1 (2 blocks): 1e-4
+# Stage 2 (4 blocks): 5e-5
+# Stage 3 (8 blocks): 2e-5
+# Stage 4 (12 blocks): 1e-5
+# Stage 5 (24 blocks): 5e-6
+
+if NUM_UNFROZEN_BLOCKS == 2:
+    backbone_lr = 1e-4
+    seg_head_lr = 1e-3
+elif NUM_UNFROZEN_BLOCKS == 4:
+    backbone_lr = 5e-5
+    seg_head_lr = 5e-4  # Also reduce seg_head LR
+elif NUM_UNFROZEN_BLOCKS == 8:
+    backbone_lr = 2e-5
+    seg_head_lr = 2e-4
+elif NUM_UNFROZEN_BLOCKS == 12:
+    backbone_lr = 1e-5
+    seg_head_lr = 1e-4
+else:  # Full unfreezing (24 blocks)
+    backbone_lr = 5e-6
+    seg_head_lr = 5e-5
+
+print(f"Learning rates: backbone={backbone_lr}, seg_head={seg_head_lr}")
+
 optimizer = AdamW(
     [
-        {"params": seg_head.parameters(), "lr": 1e-3},
-        {"params": backbone.blocks[-2:].parameters(), "lr": 1e-4},
+        {"params": seg_head.parameters(), "lr": seg_head_lr},
+        {"params": backbone.blocks[-NUM_UNFROZEN_BLOCKS:].parameters(), "lr": backbone_lr},
     ],
     weight_decay=1e-4
 )
@@ -242,12 +274,12 @@ torch.save(
 
 # 2. Save ONLY backbone in wrapper-compatible format (for replacing in dinov3 folder)
 # This matches the format that DINOv3Wrapper._extract_state_dict() expects
-torch.save(backbone.state_dict(), "dinov3_finetuned_backbone_only.pth")
+torch.save(backbone.state_dict(), f"dinov3_finetuned_backbone_only_epoch_{final_epoch}.pth")
 
 print("✅ Fine-tuning completed!")
-print("   - Full checkpoint: 'finetune_landdiscover_seg_final.pth'")
-print("   - Backbone only (wrapper-compatible): 'dinov3_finetuned_backbone_only.pth'")
-print("   → Replace 'dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth' with 'dinov3_finetuned_backbone_only.pth'")
+print(f"   - Full checkpoint: 'finetune_landdiscover_seg_epoch_{final_epoch}.pth'")
+print(f"   - Backbone only: 'dinov3_finetuned_backbone_only_epoch_{final_epoch}.pth'")
+print(f"   → Use 'dinov3_finetuned_backbone_only_epoch_{final_epoch}.pth' as RSIB_CKPT")
 
 
 # ------
