@@ -26,7 +26,7 @@ def register_flair(root):
     # ]:
     root = os.path.join(root,"FLAIR_test")
     for name,image_dirname, sem_seg_dirname in [
-         ("FLAIR_test", "test/image", "test/mask"),
+         ("FLAIR_test", "image", "mask"),
      ]:
         image_dir = os.path.join(root, image_dirname)
         gt_dir = os.path.join(root, sem_seg_dirname)
