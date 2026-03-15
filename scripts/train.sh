@@ -1,5 +1,7 @@
 #!/bin/sh
 export DETECTRON2_DATASETS='gs_net/data/datasets'
+export RSIB_CKPT='dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth'
+
 config=$1
 gpus=$2
 output=$3

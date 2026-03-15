@@ -1,10 +1,11 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath('./detectron2'))
+
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from: https://github.com/facebookresearch/detr/blob/master/models/detr.py
 # Modified by Jian Ding from: https://github.com/facebookresearch/MaskFormer/blob/main/mask_former/modeling/transformer/transformer_predictor.py
 # Modified by Heeseong Shin from: https://github.com/dingjiansw101/ZegFormer/blob/main/mask_former/mask_former_model.py
-import sys
-import os
-sys.path.insert(0, os.path.abspath('./detectron2'))
 
 import fvcore.nn.weight_init as weight_init
 import torch
@@ -70,24 +71,24 @@ class GSNetPredictor(nn.Module):
         assert self.class_texts != None
         if self.test_class_texts == None:
             self.test_class_texts = self.class_texts
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = device
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
         self.tokenizer = None
         path_to_remote_clip = '/media/zpp2/PHDD/RemoteCLIP/models--chendelong--RemoteCLIP/snapshots/bf1d8a3ccf2ddbf7c875705e46373bfe542bce38/RemoteCLIP-ViT-B-32.pt'
         if clip_pretrained == "ViT-G" or clip_pretrained == "ViT-H":
             # for OpenCLIP models
             name, pretrain = ('ViT-H-14', 'laion2b_s32b_b79k') if clip_pretrained == 'ViT-H' else ('ViT-bigG-14', 'laion2b_s39b_b160k')
             clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
-                name, 
-                pretrained=pretrain, 
-                device=device, 
+                name,
+                pretrained=pretrain,
+                device=self.device,
                 force_image_size=336,)
             self.tokenizer = open_clip.get_tokenizer(name)
         elif clip_pretrained == "RemoteCLIP-ViT-B-32":
             # for RemoteCLIP model using OpenCLIP formatted checkpoint
             model_name = 'ViT-B-32'
             model_name_clip = 'ViT-B/32'
-            clip_model, clip_preprocess = clip.load(model_name_clip, device=device, jit=False, prompt_depth=prompt_depth, prompt_length=prompt_length)
+            clip_model, clip_preprocess = clip.load(model_name_clip, device=self.device, jit=False, prompt_depth=prompt_depth, prompt_length=prompt_length)
             ckpt = torch.load(path_to_remote_clip)
             mapped_state_dict = {}
             for key, value in ckpt.items():
@@ -104,9 +105,8 @@ class GSNetPredictor(nn.Module):
             message = clip_model.load_state_dict(mapped_state_dict,strict=True)
         else:
             # for OpenAI models
-            clip_model, clip_preprocess = clip.load(clip_pretrained, device=device, jit=False, prompt_depth=prompt_depth, prompt_length=prompt_length)
-            print(f"[GSNet] Loaded CLIP model: {clip_pretrained}")
-
+            clip_model, clip_preprocess = clip.load(clip_pretrained, device=self.device, jit=False, prompt_depth=prompt_depth, prompt_length=prompt_length)
+    
         self.prompt_ensemble_type = prompt_ensemble_type        
 
         if self.prompt_ensemble_type == "imagenet_select":
