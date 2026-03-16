@@ -56,9 +56,9 @@ import timm
 # CONFIGURATION
 # ==============================================================================
 
-PRETRAINED_WEIGHTS = "sftp://hassan@130.192.93.114/nfs/home/hassan/2025-P9-Open-Vocabulary-Semantic-Segmentation/dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+PRETRAINED_WEIGHTS = "../../dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
 
-DATASET_ROOT = "sftp://hassan@130.192.93.114/nfs/home/hassan/2025-P9-Open-Vocabulary-Semantic-Segmentation/gs_net/data/datasets/LandDiscover_50K"
+DATASET_ROOT = "../data/datasets/LandDiscover_50K"
 IMG_DIR = os.path.join(DATASET_ROOT, "TR_Image")   # RGB images
 GT_DIR = os.path.join(DATASET_ROOT, "GT_ID")        # Segmentation masks
 
