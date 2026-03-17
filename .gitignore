@@ -1,0 +1,80 @@
+# Python cache / compiled files
+__pycache__/
+*.py[cod]
+*.so
+
+# Build / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Test / lint / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local env files
+.env
+.env.*
+*.local
+
+# Cluster / runtime logs
+slurm-*.out
+slurm-*.err
+nohup.out
+*.log
+
+# Training outputs / experiment artifacts
+output/
+outputs/
+runs/
+wandb/
+lightning_logs/
+tensorboard/
+tb_logs/
+logs/
+checkpoints/
+ckpts/
+artifacts/
+pretrained/
+
+# Local datasets kept inside the repo tree
+gs_net/data/datasets/*/
+
+# Temporary / cache dirs
+.cache/
+tmp/
+temp/
+
+# Optional: uncomment if local weights are created outside the folders above
+# *.ckpt
+# *.pth
+# *.pt
