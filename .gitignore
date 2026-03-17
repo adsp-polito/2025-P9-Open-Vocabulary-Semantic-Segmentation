@@ -74,7 +74,18 @@ gs_net/data/datasets/*/
 tmp/
 temp/
 
-# Optional: uncomment if local weights are created outside the folders above
-# *.ckpt
-# *.pth
-# *.pt
+
+# Local installers
+Miniconda3-latest-Linux-x86_64.sh
+
+# Local model weights / checkpoints
+*.pth
+*.pt
+*.ckpt
+
+# Optional local dependency clones
+detectron2/
+remote/
+
+# Optional local experiment scratch area
+gs_net/third_party/experiments/
