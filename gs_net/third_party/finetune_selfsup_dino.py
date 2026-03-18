@@ -13,7 +13,7 @@ Pipeline:
     5. Save backbone weights for use in GSNet
 
 Output:
-    experiments/selfsup_dino_<timestamp>/
+    output/selfsup_finetuning/selfsup_dino_<timestamp>/
         config.json              - All hyperparameters
         train_log.csv            - Per-epoch loss
         checkpoints/epoch_XX.pth - Full checkpoints (resumable)
@@ -23,7 +23,7 @@ Usage:
     python finetune_selfsup_dino.py
 
 Then test in GSNet:
-    export RSIB_CKPT='experiments/selfsup_dino_<timestamp>/backbone_for_gsnet/epoch_XX.pth'
+    export RSIB_CKPT='output/selfsup_finetuning/selfsup_dino_<timestamp>/backbone_for_gsnet/epoch_XX.pth'
 
 Requirements:
     pip install timm torchvision tqdm numpy
@@ -73,11 +73,27 @@ import timm
 # CONFIGURATION - CHANGE THESE PATHS AS NEEDED
 # ==============================================================================
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+OUTPUT_ROOT = os.path.join(PROJECT_DIR, "output", "selfsup_finetuning")
+
 # !! CHANGE THIS TO YOUR ACTUAL CHECKPOINT PATH !!
-PRETRAINED_WEIGHTS = "./dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+PRETRAINED_WEIGHTS = os.path.join(
+    PROJECT_DIR,
+    "dinov3",
+    "vitl16-sat493m",
+    "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
+)
 
 # !! CHANGE THIS TO YOUR ACTUAL DATASET PATH !!
-DATASET_DIR = "../data/datasets/LandDiscover_50K/TR_Image"  # Only images, no labels needed
+DATASET_DIR = os.path.join(
+    PROJECT_DIR,
+    "gs_net",
+    "data",
+    "datasets",
+    "LandDiscover_50K",
+    "TR_Image",
+)  # Only images, no labels needed
 
 # Training config
 IMG_SIZE = 384
@@ -118,7 +134,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def create_experiment_dir():
     """Create organized output directory for this run."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_dir = f"experiments/selfsup_dino_{timestamp}"
+    run_id = f"selfsup_dino_{timestamp}"
+    exp_dir = os.path.join(OUTPUT_ROOT, run_id)
     os.makedirs(f"{exp_dir}/checkpoints", exist_ok=True)
     os.makedirs(f"{exp_dir}/backbone_for_gsnet", exist_ok=True)
     return exp_dir
@@ -284,6 +301,60 @@ def log_epoch(exp_dir, epoch, train_loss, phase):
         writer.writerow([epoch, f"{train_loss:.6f}", phase])
 
 
+def log_run_summary(exp_dir, config, final_loss, duration_minutes):
+    """Append one row to global run summary CSV under output root."""
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    path = os.path.join(OUTPUT_ROOT, "run_summary.csv")
+    run_id = os.path.basename(exp_dir)
+    final_checkpoint = os.path.join(exp_dir, "checkpoints", f"epoch_{TOTAL_EPOCHS:02d}.pth")
+    final_backbone = os.path.join(exp_dir, "backbone_for_gsnet", f"epoch_{TOTAL_EPOCHS:02d}.pth")
+
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow([
+                "timestamp",
+                "run_id",
+                "exp_dir",
+                "final_loss",
+                "duration_minutes",
+                "data_fraction",
+                "warmup_epochs",
+                "train_epochs",
+                "total_epochs",
+                "num_unfrozen_blocks",
+                "lr_heads",
+                "lr_backbone",
+                "weight_decay",
+                "ema_momentum",
+                "teacher_temp",
+                "student_temp",
+                "final_checkpoint",
+                "final_backbone",
+            ])
+        writer.writerow([
+            datetime.now().isoformat(timespec="seconds"),
+            run_id,
+            exp_dir,
+            f"{final_loss:.6f}",
+            f"{duration_minutes:.2f}",
+            config["data_fraction"],
+            config["warmup_epochs"],
+            config["train_epochs"],
+            config["total_epochs"],
+            config["num_unfrozen_blocks"],
+            config["lr_heads"],
+            config["lr_backbone"],
+            config["weight_decay"],
+            config["ema_momentum"],
+            config["teacher_temp"],
+            config["student_temp"],
+            final_checkpoint,
+            final_backbone,
+        ])
+
+
 # ==============================================================================
 # TRAINING LOOP
 # ==============================================================================
@@ -384,10 +455,12 @@ def main():
     print(f"Experiment directory: {exp_dir}")
 
     # --- Build config dict ---
+    run_start_time = time.time()
     config = {
         "method": "selfsup_dino",
         "pretrained_weights": PRETRAINED_WEIGHTS,
         "dataset_dir": DATASET_DIR,
+        "output_root": OUTPUT_ROOT,
         "img_size": IMG_SIZE,
         "batch_size": BATCH_SIZE,
         "grad_accum_steps": GRAD_ACCUM_STEPS,
@@ -525,13 +598,13 @@ def main():
             grad_accum_steps=GRAD_ACCUM_STEPS, unfreeze_backbone=True,
         )
 
-        scheduler.step()
-
         current_lr_heads = optimizer.param_groups[0]["lr"]
         current_lr_backbone = optimizer.param_groups[1]["lr"]
         print(f"  Epoch {epoch} | Loss: {avg_loss:.4f} | "
               f"LR heads: {current_lr_heads:.2e} | LR backbone: {current_lr_backbone:.2e}")
         log_epoch(exp_dir, epoch, avg_loss, "dino")
+
+        scheduler.step()
 
         # Save checkpoint and backbone for GSNet
         if (epoch - WARMUP_EPOCHS) % SAVE_EVERY == 0 or epoch == TOTAL_EPOCHS:
@@ -545,7 +618,12 @@ def main():
     print("\n" + "=" * 80)
     print("Training complete!")
     print("=" * 80)
+
+    duration_minutes = (time.time() - run_start_time) / 60.0
+    log_run_summary(exp_dir, config, final_loss=avg_loss, duration_minutes=duration_minutes)
+
     print(f"\nExperiment directory: {exp_dir}")
+    print(f"Global run summary: {os.path.join(OUTPUT_ROOT, 'run_summary.csv')}")
     print(f"\nTo test in GSNet:")
     print(f"  export RSIB_CKPT='{exp_dir}/backbone_for_gsnet/epoch_{TOTAL_EPOCHS:02d}.pth'")
     print(f"\nTo compare different epochs, try each backbone_for_gsnet/epoch_XX.pth")
