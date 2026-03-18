@@ -68,7 +68,7 @@ IMG_SIZE = 384
 BATCH_SIZE = 1              # Physical batch size (limited by GPU memory)
 GRAD_ACCUM_STEPS = 4        # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS = 4
 WARMUP_EPOCHS = 2           # Head-only warmup
-TRAIN_EPOCHS = 10            # Backbone + head training
+TRAIN_EPOCHS = 15            # Backbone + head training
 TOTAL_EPOCHS = WARMUP_EPOCHS + TRAIN_EPOCHS  # 7 total
 SAVE_EVERY = 1              # Save checkpoint every N epochs after warmup
 DATA_FRACTION = 0.5         # Use 50% of dataset (~26K images)
@@ -86,8 +86,8 @@ IGNORE_INDEX = 255
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# RESUME_FROM = None
-RESUME_FROM = "experiments/sup_unfreeze_20260316_163032/checkpoints/epoch_07.pth"
+RESUME_FROM = None
+# RESUME_FROM = "experiments/sup_unfreeze_20260316_163032/checkpoints/epoch_07.pth"
 
 # ==============================================================================
 # EXPERIMENT DIRECTORY
