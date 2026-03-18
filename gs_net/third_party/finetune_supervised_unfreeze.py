@@ -68,7 +68,7 @@ IMG_SIZE = 384
 BATCH_SIZE = 1              # Physical batch size (limited by GPU memory)
 GRAD_ACCUM_STEPS = 4        # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS = 4
 WARMUP_EPOCHS = 2           # Head-only warmup
-TRAIN_EPOCHS = 5            # Backbone + head training
+TRAIN_EPOCHS = 10            # Backbone + head training
 TOTAL_EPOCHS = WARMUP_EPOCHS + TRAIN_EPOCHS  # 7 total
 SAVE_EVERY = 1              # Save checkpoint every N epochs after warmup
 DATA_FRACTION = 0.5         # Use 50% of dataset (~26K images)
