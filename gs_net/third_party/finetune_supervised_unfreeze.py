@@ -85,6 +85,10 @@ WEIGHT_DECAY = 0.05
 IGNORE_INDEX = 255
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+# RESUME_FROM = None
+RESUME_FROM = "experiments/sup_unfreeze_20260316_163032/checkpoints/epoch_07.pth"
+
 # ==============================================================================
 # EXPERIMENT DIRECTORY
 # ==============================================================================
@@ -273,17 +277,21 @@ def save_config(exp_dir, config_dict):
     print(f"Config saved to {path}")
 
 
-def save_checkpoint(exp_dir, epoch, backbone, seg_head, optimizer, train_loss, config):
+def save_checkpoint(exp_dir, epoch, backbone, seg_head, optimizer, train_loss, config, phase, scheduler=None):
     """Save full training checkpoint (resumable)."""
     path = os.path.join(exp_dir, "checkpoints", f"epoch_{epoch:02d}.pth")
-    torch.save({
+    ckpt = {
         "epoch": epoch,
+        "phase": phase,
         "backbone": backbone.state_dict(),
         "seg_head": seg_head.state_dict(),
         "optimizer": optimizer.state_dict(),
         "train_loss": train_loss,
         "config": config,
-    }, path)
+    }
+    if scheduler is not None:
+        ckpt["scheduler"] = scheduler.state_dict()
+    torch.save(ckpt, path)
     print(f"  Saved checkpoint: {path}")
 
 
@@ -370,9 +378,20 @@ def main():
     print("Supervised Fine-Tuning with Partial Unfreezing")
     print("=" * 80)
 
-    # --- Create experiment directory ---
-    exp_dir = create_experiment_dir()
-    print(f"Experiment directory: {exp_dir}")
+    # --- Resume or create experiment directory ---
+    resume_ckpt = None
+    start_epoch = 0
+    if RESUME_FROM:
+        print(f"Resuming from checkpoint: {RESUME_FROM}")
+        resume_ckpt = torch.load(RESUME_FROM, map_location="cpu")
+        start_epoch = resume_ckpt["epoch"]
+        # Reuse the existing experiment directory
+        exp_dir = os.path.dirname(os.path.dirname(RESUME_FROM))  # .../checkpoints/../
+        print(f"Experiment directory: {exp_dir}")
+        print(f"Resuming after epoch {start_epoch} (phase: {resume_ckpt.get('phase', 'unknown')})")
+    else:
+        exp_dir = create_experiment_dir()
+        print(f"Experiment directory: {exp_dir}")
 
     # --- Build config dict ---
     config = {
@@ -414,15 +433,19 @@ def main():
         img_size=IMG_SIZE,
     )
 
-    # Load pretrained weights
-    ckpt = torch.load(PRETRAINED_WEIGHTS, map_location="cpu")
-    if isinstance(ckpt, dict) and "teacher_state_dict" in ckpt:
-        backbone.load_state_dict(ckpt["teacher_state_dict"], strict=False)
-    elif isinstance(ckpt, dict) and "model" in ckpt:
-        backbone.load_state_dict(ckpt["model"], strict=False)
+    # Load pretrained weights (always load as base, then overlay resume ckpt if present)
+    pretrained = torch.load(PRETRAINED_WEIGHTS, map_location="cpu")
+    if isinstance(pretrained, dict) and "teacher_state_dict" in pretrained:
+        backbone.load_state_dict(pretrained["teacher_state_dict"], strict=False)
+    elif isinstance(pretrained, dict) and "model" in pretrained:
+        backbone.load_state_dict(pretrained["model"], strict=False)
     else:
-        backbone.load_state_dict(ckpt, strict=False)
+        backbone.load_state_dict(pretrained, strict=False)
     print("Pretrained weights loaded.")
+
+    if resume_ckpt is not None:
+        backbone.load_state_dict(resume_ckpt["backbone"])
+        print("Backbone weights restored from checkpoint.")
 
     # Freeze entire backbone
     for p in backbone.parameters():
@@ -443,30 +466,41 @@ def main():
         img_size=IMG_SIZE,
     ).to(DEVICE)
 
+    if resume_ckpt is not None:
+        seg_head.load_state_dict(resume_ckpt["seg_head"])
+        print("Segmentation head weights restored from checkpoint.")
+
     # ==================================================================
     # PHASE 1: HEAD WARMUP (backbone fully frozen, only head trains)
     # ==================================================================
-    print("\n" + "=" * 80)
-    print(f"PHASE 1: Head Warmup ({WARMUP_EPOCHS} epochs)")
-    print("=" * 80)
-
     optimizer_warmup = AdamW(seg_head.parameters(), lr=LR_HEAD, weight_decay=WEIGHT_DECAY)
 
-    for epoch in range(1, WARMUP_EPOCHS + 1):
-        avg_loss = train_one_epoch(backbone, seg_head, loader, optimizer_warmup,
-                                   epoch=epoch, phase="warmup", grad_accum_steps=GRAD_ACCUM_STEPS)
-        print(f"  Epoch {epoch} | Loss: {avg_loss:.4f}")
-        log_epoch(exp_dir, epoch, avg_loss, "warmup")
+    if start_epoch >= WARMUP_EPOCHS:
+        print(f"\nSkipping warmup phase (already completed at epoch {WARMUP_EPOCHS})")
+    else:
+        print("\n" + "=" * 80)
+        print(f"PHASE 1: Head Warmup ({WARMUP_EPOCHS} epochs, resuming from epoch {start_epoch})")
+        print("=" * 80)
 
-    # Save warmup checkpoint
-    save_checkpoint(exp_dir, WARMUP_EPOCHS, backbone, seg_head, optimizer_warmup, avg_loss, config)
-    print("Head warmup complete.\n")
+        if resume_ckpt is not None and resume_ckpt.get("phase") == "warmup":
+            optimizer_warmup.load_state_dict(resume_ckpt["optimizer"])
+            print("Warmup optimizer state restored.")
+
+        for epoch in range(start_epoch + 1, WARMUP_EPOCHS + 1):
+            avg_loss = train_one_epoch(backbone, seg_head, loader, optimizer_warmup,
+                                       epoch=epoch, phase="warmup", grad_accum_steps=GRAD_ACCUM_STEPS)
+            print(f"  Epoch {epoch} | Loss: {avg_loss:.4f}")
+            log_epoch(exp_dir, epoch, avg_loss, "warmup")
+
+        # Save warmup checkpoint
+        save_checkpoint(exp_dir, WARMUP_EPOCHS, backbone, seg_head, optimizer_warmup, avg_loss, config, phase="warmup")
+        print("Head warmup complete.\n")
 
     # ==================================================================
     # PHASE 2: PARTIAL UNFREEZE + HEAD TRAINING
     # ==================================================================
     print("=" * 80)
-    print(f"PHASE 2: Unfreeze last {NUM_UNFROZEN_BLOCKS} blocks + Head ({TRAIN_EPOCHS} epochs)")
+    print(f"PHASE 2: Unfreeze last {NUM_UNFROZEN_BLOCKS} blocks + Head ({TRAIN_EPOCHS} epochs, resuming from epoch {max(start_epoch, WARMUP_EPOCHS)})")
     print("=" * 80)
 
     # Unfreeze last N blocks
@@ -490,7 +524,14 @@ def main():
     # Cosine LR scheduler (per-epoch stepping)
     scheduler = CosineAnnealingLR(optimizer, T_max=TRAIN_EPOCHS, eta_min=1e-6)
 
-    for epoch in range(WARMUP_EPOCHS + 1, TOTAL_EPOCHS + 1):
+    if resume_ckpt is not None and resume_ckpt.get("phase") == "unfreeze":
+        optimizer.load_state_dict(resume_ckpt["optimizer"])
+        if "scheduler" in resume_ckpt:
+            scheduler.load_state_dict(resume_ckpt["scheduler"])
+        print("Unfreeze optimizer and scheduler state restored.")
+
+    unfreeze_start = max(start_epoch, WARMUP_EPOCHS)
+    for epoch in range(unfreeze_start + 1, TOTAL_EPOCHS + 1):
         avg_loss = train_one_epoch(backbone, seg_head, loader, optimizer,
                                    epoch=epoch, phase="unfreeze", grad_accum_steps=GRAD_ACCUM_STEPS)
 
@@ -504,7 +545,7 @@ def main():
 
         # Save checkpoint and backbone for GSNet
         if (epoch - WARMUP_EPOCHS) % SAVE_EVERY == 0 or epoch == TOTAL_EPOCHS:
-            save_checkpoint(exp_dir, epoch, backbone, seg_head, optimizer, avg_loss, config)
+            save_checkpoint(exp_dir, epoch, backbone, seg_head, optimizer, avg_loss, config, phase="unfreeze", scheduler=scheduler)
             save_backbone_for_gsnet(backbone, epoch, exp_dir)
 
     # ==================================================================
