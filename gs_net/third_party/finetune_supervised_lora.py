@@ -60,10 +60,8 @@ import timm
 # CONFIGURATION - CHANGE THESE PATHS AS NEEDED
 # ==============================================================================
 
-# !! CHANGE THIS TO YOUR ACTUAL CHECKPOINT PATH !!
-PRETRAINED_WEIGHTS = "./dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+PRETRAINED_WEIGHTS = "../../dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
 
-# !! CHANGE THIS TO YOUR ACTUAL DATASET PATH !!
 DATASET_ROOT = "../data/datasets/LandDiscover_50K"
 IMG_DIR = os.path.join(DATASET_ROOT, "TR_Image")   # RGB images
 GT_DIR = os.path.join(DATASET_ROOT, "GT_ID")        # Segmentation masks
@@ -74,8 +72,8 @@ IMG_SIZE = 384
 BATCH_SIZE = 1              # Physical batch size (limited by GPU memory)
 GRAD_ACCUM_STEPS = 4        # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS = 4
 WARMUP_EPOCHS = 2           # Head-only warmup
-TRAIN_EPOCHS = 5            # LoRA + head training
-TOTAL_EPOCHS = WARMUP_EPOCHS + TRAIN_EPOCHS  # 7 total
+TRAIN_EPOCHS = 15            # LoRA + head training
+TOTAL_EPOCHS = WARMUP_EPOCHS + TRAIN_EPOCHS  # 17 total
 SAVE_EVERY = 1              # Save checkpoint every N epochs after warmup
 DATA_FRACTION = 0.5         # Use 50% of dataset (~26K images)
 DATA_SEED = 42              # Fixed seed for reproducible subset
