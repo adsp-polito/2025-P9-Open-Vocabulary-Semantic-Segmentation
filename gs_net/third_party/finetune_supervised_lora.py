@@ -483,7 +483,7 @@ def main():
     # --- Backbone ---
     print("\nLoading DINOv3 backbone...")
     backbone = timm.create_model(
-        "vit_large_patch16_dinov3",
+        "vit_large_patch16_dinov3.sat493m",
         pretrained=False,
         num_classes=0,
         dynamic_img_size=True,
