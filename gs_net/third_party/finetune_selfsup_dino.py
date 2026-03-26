@@ -77,7 +77,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 OUTPUT_ROOT = os.path.join(PROJECT_DIR, "output", "selfsup_finetuning")
 
-# !! CHANGE THIS TO YOUR ACTUAL CHECKPOINT PATH !!
 PRETRAINED_WEIGHTS = os.path.join(
     PROJECT_DIR,
     "dinov3",
@@ -85,7 +84,6 @@ PRETRAINED_WEIGHTS = os.path.join(
     "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
 )
 
-# !! CHANGE THIS TO YOUR ACTUAL DATASET PATH !!
 DATASET_DIR = os.path.join(
     PROJECT_DIR,
     "gs_net",
@@ -100,8 +98,8 @@ IMG_SIZE = 384
 BATCH_SIZE = 1              # Physical batch size (limited by GPU memory)
 GRAD_ACCUM_STEPS = 4        # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS = 4
 WARMUP_EPOCHS = 2           # Head-only warmup (backbone frozen)
-TRAIN_EPOCHS = 5            # Backbone + head training
-TOTAL_EPOCHS = WARMUP_EPOCHS + TRAIN_EPOCHS  # 7 total (matches supervised scripts)
+TRAIN_EPOCHS = 15            # Backbone + head training
+TOTAL_EPOCHS = WARMUP_EPOCHS + TRAIN_EPOCHS  # 17 total (matches supervised scripts)
 SAVE_EVERY = 1              # Save checkpoint every N epochs after warmup
 DATA_FRACTION = 0.5         # Use 50% of dataset (~26K images, matches supervised scripts)
 DATA_SEED = 42              # Fixed seed for reproducible subset
