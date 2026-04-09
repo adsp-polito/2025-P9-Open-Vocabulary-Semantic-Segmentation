@@ -75,7 +75,7 @@ WARMUP_EPOCHS = 2           # Head-only warmup
 TRAIN_EPOCHS = 15            # LoRA + head training
 TOTAL_EPOCHS = WARMUP_EPOCHS + TRAIN_EPOCHS  # 17 total
 SAVE_EVERY = 1              # Save checkpoint every N epochs after warmup
-DATA_FRACTION = 0.5         # Use 50% of dataset (~26K images)
+DATA_FRACTION = 1         # Use 50% of dataset (~26K images)
 DATA_SEED = 42              # Fixed seed for reproducible subset
 
 # LoRA config
