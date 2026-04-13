@@ -28,7 +28,7 @@ DETECTRON2_DATASETS = os.environ.get(
     "DETECTRON2_DATASETS", "../data/datasets"
 )
 TALK2DINO_DIR = os.environ.get("TALK2DINO_DIR", "Talk2DINO-ViTB")
-TALK2DINO_SRC = os.environ.get("TALK2DINO_SRC", ".")
+TALK2DINO_SRC = os.environ.get("TALK2DINO_SRC", TALK2DINO_DIR)
 
 DATASET_CONFIGS = {
     "potsdam_all": {
@@ -83,10 +83,10 @@ DATASET_CONFIGS = {
 # ──────────────────────────────────────────────────────────────
 # Model loading
 # ──────────────────────────────────────────────────────────────
-def load_model(device: str):
-    sys.path.insert(0, TALK2DINO_SRC)
-    from talk2dino_vitb.configuration_talk2dino import Talk2DINOConfig
-    from talk2dino_vitb.modeling_talk2dino import Talk2DINO
+def load_model(device):
+    sys.path.insert(0, TALK2DINO_DIR)
+    from configuration_talk2dino import Talk2DINOConfig
+    from modeling_talk2dino import Talk2DINO
     from safetensors.torch import load_file
 
     config = Talk2DINOConfig.from_pretrained(TALK2DINO_DIR)
