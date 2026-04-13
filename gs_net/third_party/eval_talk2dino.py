@@ -86,24 +86,37 @@ DATASET_CONFIGS = {
 def load_model(device):
     # The HF repo files use relative imports, so they must live inside a package.
     # Create a 'talk2dino_vitb' package pointing to Talk2DINO-ViTB/ if needed.
-    pkg_dir = os.path.join(os.path.dirname(TALK2DINO_DIR), "talk2dino_vitb")
+    pkg_dir = os.path.join(os.path.dirname(os.path.abspath(TALK2DINO_DIR)), "talk2dino_vitb")
     if not os.path.exists(pkg_dir):
         os.makedirs(pkg_dir, exist_ok=True)
-        # Symlink all .py files into the package
         for f in os.listdir(TALK2DINO_DIR):
             if f.endswith(".py"):
                 os.symlink(
                     os.path.join(os.path.abspath(TALK2DINO_DIR), f),
                     os.path.join(pkg_dir, f),
                 )
-        # Create __init__.py so Python treats it as a package
         open(os.path.join(pkg_dir, "__init__.py"), "w").close()
         print(f"Created talk2dino_vitb package at {pkg_dir}")
 
-    sys.path.insert(0, os.path.dirname(pkg_dir))
+    # Temporarily remove CWD from sys.path so that third_party/clip.py
+    # doesn't shadow the pip-installed 'clip' package.
+    cwd = os.getcwd()
+    paths_to_hide = [p for p in sys.path if os.path.abspath(p) == os.path.abspath(cwd)]
+    for p in paths_to_hide:
+        sys.path.remove(p)
+
+    pkg_parent = os.path.dirname(pkg_dir)
+    if pkg_parent not in sys.path:
+        sys.path.insert(0, pkg_parent)
+
     from talk2dino_vitb.configuration_talk2dino import Talk2DINOConfig
     from talk2dino_vitb.modeling_talk2dino import Talk2DINO
     from safetensors.torch import load_file
+
+    # Restore paths
+    for p in paths_to_hide:
+        if p not in sys.path:
+            sys.path.append(p)
 
     config = Talk2DINOConfig.from_pretrained(TALK2DINO_DIR)
     model = Talk2DINO(config)
