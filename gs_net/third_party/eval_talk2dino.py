@@ -23,7 +23,7 @@ from detectron2.evaluation import SemSegEvaluator
 
 # ──────────────────────────────────────────────────────────────
 # Config
-# ──────────────────────────────────────────────────────────────    
+# ──────────────────────────────────────────────────────────────
 DETECTRON2_DATASETS = os.environ.get(
     "DETECTRON2_DATASETS", "../data/datasets"
 )
@@ -192,7 +192,7 @@ def parse_args():
     parser.add_argument(
         "datasets",
         nargs="*",
-        default=list(DATASET_CONFIGS.keys()),
+        default=None,
         choices=list(DATASET_CONFIGS.keys()),
         help="Datasets to evaluate (default: all).",
     )
@@ -207,10 +207,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    datasets = args.datasets or list(DATASET_CONFIGS.keys())
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(device)
 
-    for ds in args.datasets:
+    for ds in datasets:
         print(f"\n>>> Evaluating: {ds}")
         evaluate_dataset(model, ds, args.max_images, device)
 
