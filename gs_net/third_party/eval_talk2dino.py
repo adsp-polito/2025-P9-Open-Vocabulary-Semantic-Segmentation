@@ -23,9 +23,9 @@ from detectron2.evaluation import SemSegEvaluator
 
 # ──────────────────────────────────────────────────────────────
 # Config
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────    
 DETECTRON2_DATASETS = os.environ.get(
-    "DETECTRON2_DATASETS", "/content/drive/MyDrive/OVRSISS_test"
+    "DETECTRON2_DATASETS", "../data/datasets"
 )
 TALK2DINO_DIR = os.environ.get("TALK2DINO_DIR", "Talk2DINO-ViTB")
 TALK2DINO_SRC = os.environ.get("TALK2DINO_SRC", ".")
