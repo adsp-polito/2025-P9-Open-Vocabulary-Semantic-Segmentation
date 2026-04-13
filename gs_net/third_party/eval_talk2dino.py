@@ -84,39 +84,34 @@ DATASET_CONFIGS = {
 # Model loading
 # ──────────────────────────────────────────────────────────────
 def load_model(device):
-    # The HF repo files use relative imports, so they must live inside a package.
-    # Create a 'talk2dino_vitb' package pointing to Talk2DINO-ViTB/ if needed.
-    pkg_dir = os.path.join(os.path.dirname(os.path.abspath(TALK2DINO_DIR)), "talk2dino_vitb")
-    if not os.path.exists(pkg_dir):
-        os.makedirs(pkg_dir, exist_ok=True)
-        for f in os.listdir(TALK2DINO_DIR):
-            if f.endswith(".py"):
-                os.symlink(
-                    os.path.join(os.path.abspath(TALK2DINO_DIR), f),
-                    os.path.join(pkg_dir, f),
-                )
-        open(os.path.join(pkg_dir, "__init__.py"), "w").close()
-        print(f"Created talk2dino_vitb package at {pkg_dir}")
+    import shutil
+    import tempfile
 
-    # Temporarily remove CWD from sys.path so that third_party/clip.py
-    # doesn't shadow the pip-installed 'clip' package.
+    # Copy Talk2DINO source files into an isolated temp package so that
+    # third_party/clip.py cannot shadow the pip-installed 'clip' package.
+    tmp_root = tempfile.mkdtemp(prefix="talk2dino_")
+    pkg_dir = os.path.join(tmp_root, "talk2dino_vitb")
+    os.makedirs(pkg_dir)
+    for f in os.listdir(TALK2DINO_DIR):
+        if f.endswith(".py"):
+            shutil.copy2(os.path.join(os.path.abspath(TALK2DINO_DIR), f), pkg_dir)
+    open(os.path.join(pkg_dir, "__init__.py"), "w").close()
+
+    # Put ONLY the temp dir on sys.path (at the front), hide CWD + '' entries
+    saved_path = sys.path[:]
     cwd = os.getcwd()
-    paths_to_hide = [p for p in sys.path if os.path.abspath(p) == os.path.abspath(cwd)]
-    for p in paths_to_hide:
-        sys.path.remove(p)
-
-    pkg_parent = os.path.dirname(pkg_dir)
-    if pkg_parent not in sys.path:
-        sys.path.insert(0, pkg_parent)
+    sys.path = [tmp_root] + [p for p in sys.path
+                              if p not in ("", ".", cwd, os.path.abspath(cwd))]
+    import importlib
+    importlib.invalidate_caches()
 
     from talk2dino_vitb.configuration_talk2dino import Talk2DINOConfig
     from talk2dino_vitb.modeling_talk2dino import Talk2DINO
     from safetensors.torch import load_file
 
-    # Restore paths
-    for p in paths_to_hide:
-        if p not in sys.path:
-            sys.path.append(p)
+    # Restore original sys.path
+    sys.path = saved_path
+    importlib.invalidate_caches()
 
     config = Talk2DINOConfig.from_pretrained(TALK2DINO_DIR)
     model = Talk2DINO(config)
