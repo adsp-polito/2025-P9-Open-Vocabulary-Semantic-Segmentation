@@ -215,5 +215,5 @@ def main():
         evaluate_dataset(model, ds, args.max_images, device)
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
