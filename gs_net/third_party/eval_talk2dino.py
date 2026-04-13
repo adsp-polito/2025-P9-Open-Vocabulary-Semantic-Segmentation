@@ -27,8 +27,8 @@ from detectron2.evaluation import SemSegEvaluator
 DETECTRON2_DATASETS = os.environ.get(
     "DETECTRON2_DATASETS", "/content/drive/MyDrive/OVRSISS_test"
 )
-TALK2DINO_DIR = os.environ.get("TALK2DINO_DIR", "/content/Talk2DINO-ViTB")
-TALK2DINO_SRC = os.environ.get("TALK2DINO_SRC", "/content")
+TALK2DINO_DIR = os.environ.get("TALK2DINO_DIR", "Talk2DINO-ViTB")
+TALK2DINO_SRC = os.environ.get("TALK2DINO_SRC", ".")
 
 DATASET_CONFIGS = {
     "potsdam_all": {
@@ -104,7 +104,7 @@ def load_model(device: str):
 # ──────────────────────────────────────────────────────────────
 # Evaluation
 # ──────────────────────────────────────────────────────────────
-def evaluate_dataset(model, dataset_name: str, max_images: int | None, device: str):
+def evaluate_dataset(model, dataset_name, max_images, device):
     cfg = DATASET_CONFIGS[dataset_name]
 
     # Register dataset (idempotent)
@@ -215,5 +215,5 @@ def main():
         evaluate_dataset(model, ds, args.max_images, device)
 
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
