@@ -193,8 +193,9 @@ def parse_args():
         "datasets",
         nargs="*",
         default=None,
-        choices=list(DATASET_CONFIGS.keys()),
-        help="Datasets to evaluate (default: all).",
+        help="Datasets to evaluate: {}. Default: all.".format(
+            ", ".join(DATASET_CONFIGS.keys())
+        ),
     )
     parser.add_argument(
         "--max-images",
@@ -208,6 +209,9 @@ def parse_args():
 def main():
     args = parse_args()
     datasets = args.datasets or list(DATASET_CONFIGS.keys())
+    for ds in datasets:
+        if ds not in DATASET_CONFIGS:
+            sys.exit(f"Unknown dataset: {ds}. Choose from: {list(DATASET_CONFIGS.keys())}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(device)
 
