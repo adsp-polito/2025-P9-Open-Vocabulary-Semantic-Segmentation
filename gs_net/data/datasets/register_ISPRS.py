@@ -20,7 +20,7 @@ def register_potsdam(root):
     #     ("test", "images/validation", "annotations_detectron2/validation"),
     # ]:
     for name,image_dirname, sem_seg_dirname in [
-         ("potsdam_all", "img_dir/val", "ann_dir/val"),
+         ("PotsdamSplit", "img_dir/val", "ann_dir/val"),
      ]:
         image_dir = os.path.join(root, image_dirname)
         gt_dir = os.path.join(root, sem_seg_dirname)

@@ -1,0 +1,75 @@
+_BASE_: config.yaml
+MODEL:
+  META_ARCHITECTURE: 'GSNet'
+  PIXEL_MEAN: [123.675, 116.280, 103.530]
+  PIXEL_STD: [58.395, 57.120, 57.375]
+  SEM_SEG_HEAD:
+    NAME: 'GSNetHead'
+    IN_FEATURES: ['res2', 'res3', 'res4']
+    IGNORE_VALUE: 255
+    NUM_CLASSES: 40
+    TRAIN_CLASS_JSON: 'datasets/landdiscover.json'
+    TEST_CLASS_JSON: 'datasets/floodnet.json'
+    # ViT-L/14@336px: Large CLIP model with 336x336 resolution
+    # - Image encoder output: 1024-dim features
+    # - Text encoder output: 768-dim embeddings (same as ViT-B)
+    # - Layer indexes: [7, 15] for intermediate features
+    CLIP_PRETRAINED: 'ViT-L/14@336px'
+    PROMPT_DEPTH: 0
+    PROMPT_LENGTH: 0
+    # Text guidance dimension (CLIP text encoder output)
+    TEXT_GUIDANCE_DIM: 768
+    TEXT_GUIDANCE_PROJ_DIM: 128
+    # Appearance guidance from CLIP image features (1024-dim)
+    APPEARANCE_GUIDANCE_DIM: 768
+    APPEARANCE_GUIDANCE_PROJ_DIM: 128
+    DECODER_DIMS: [64, 32]
+    DECODER_GUIDANCE_DIMS: [256, 128]
+    DECODER_GUIDANCE_PROJ_DIMS: [32, 16]
+    # Enable both CLIP and DINOv3 correlation
+    USE_CLIP_CORR: True
+    USE_DINO_CORR: True
+    # Query-guided fusion handles different feature dimensions (CLIP: 1024, DINO: 768)
+    FUSION_TYPE: 'query_guided'
+    # CLIP decoder guidance dimensions
+    DECODER_CLIP_GUIDANCE_DIMS: [256, 128]
+    DECODER_CLIP_GUIDANCE_PROJ_DIMS: [32, 16]
+    # DINOv3 decoder guidance dimensions
+    DECODER_DINO_GUIDANCE_DIMS: [256, 128]
+    DECODER_DINO_GUIDANCE_PROJ_DIMS: [32, 16]
+    NUM_LAYERS: 2
+    NUM_HEADS: 4
+    HIDDEN_DIMS: 128
+    POOLING_SIZES: [2, 2]
+    FEATURE_RESOLUTION: [24, 24]
+    WINDOW_SIZES: 12
+    ATTENTION_TYPE: 'linear'
+    # Fine-tuning strategy: attention (QV fine-tuning)
+    CLIP_FINETUNE: 'attention'
+    # DINOv3 fine-tuning strategy
+    DINO_FINETUNE: 'attention'
+  PROMPT_ENSEMBLE_TYPE: 'single'
+INPUT:
+  MIN_SIZE_TRAIN: (384, )
+  MIN_SIZE_TRAIN_SAMPLING: 'choice'
+  MIN_SIZE_TEST: 640
+  CROP:
+    ENABLED: True
+    TYPE: 'absolute'
+    SIZE: (384, 384)
+  SIZE_DIVISIBILITY: 384
+  FORMAT: 'RGB'
+  DATASET_MAPPER_NAME: 'mask_former_semantic'
+DATASETS:
+  TRAIN: ("LandDiscover_50K",)
+  TEST: ("FloodNet",)
+SOLVER:
+  IMS_PER_BATCH: 4  # Reduce to 2 if OOM with ViT-L
+  LR_SCHEDULER_NAME: WarmupCosineLR
+  BASE_LR: 0.0002
+  MAX_ITER: 30000
+  BACKBONE_MULTIPLIER: 0.0  # Freeze DINOv3 backbone
+  CLIP_MULTIPLIER: 0.01     # Fine-tune CLIP with small LR
+TEST:
+  EVAL_PERIOD: 5000
+  SLIDING_WINDOW: False
