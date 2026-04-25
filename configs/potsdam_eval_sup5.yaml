@@ -1,0 +1,19 @@
+_BASE_: vitl_336_dinov3.yaml
+
+MODEL:
+  META_ARCHITECTURE: 'GSNet'
+  WEIGHTS: 'checkpoints/GSNet/GSNet_sup_partial_unfreeze_5epochs.pth'
+  PROMPT_ENSEMBLE_TYPE: 'single'
+  SEM_SEG_HEAD:
+    TEST_CLASS_JSON: 'datasets/potsdam.json'
+    POOLING_SIZES: [2, 2]
+
+DATASETS:
+  TEST: ("PotsdamSplit",)
+
+INPUT:
+  MIN_SIZE_TEST: 1536
+  MAX_SIZE_TEST: 4096
+
+TEST:
+  SLIDING_WINDOW: False

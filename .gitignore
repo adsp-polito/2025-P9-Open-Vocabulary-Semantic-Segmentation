@@ -67,11 +67,7 @@ artifacts/
 pretrained/
 
 # Local datasets kept inside the repo tree
-gs_net/data/datasets/
-
-
-# Local experiment scratch
-experiments/
+gs_net/data/datasets/*/
 
 # Temporary / cache dirs
 .cache/
@@ -93,3 +89,6 @@ remote/
 
 # Optional local experiment scratch area
 gs_net/third_party/experiments/
+gs_net/third_party/eval_output/
+LOCAL_AGENT_REFERENCE.md
+/output/

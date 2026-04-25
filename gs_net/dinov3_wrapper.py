@@ -90,11 +90,18 @@ class DINOv3Wrapper(nn.Module):
                 f"Checkpoint not found at {self.checkpoint_path}. "
                 f"Please verify the path exists."
             )
-        
+
         checkpoint = torch.load(self.checkpoint_path, map_location='cpu', weights_only=False)
-        
+
         # 3. Handle different checkpoint formats
         state_dict = self._extract_state_dict(checkpoint)
+
+        # Clear checkpoint from memory to save RAM
+        del checkpoint
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # 4. Load with flexible key matching
         print(f"Loading state dict into model...")
@@ -175,16 +182,17 @@ class DINOv3Wrapper(nn.Module):
     def _extract_state_dict(self, checkpoint):
         """
         Extract state_dict from various checkpoint formats.
-        
+
         Handles:
         - Direct state_dict
         - Wrapped in 'model' key
         - Wrapped in 'state_dict' key
+        - Wrapped in 'backbone' key (for fine-tuned models)
         - Teacher-student format
-        
+
         Args:
             checkpoint: Loaded checkpoint (dict or state_dict)
-            
+
         Returns:
             state_dict: Model weights dictionary
         """
@@ -196,6 +204,10 @@ class DINOv3Wrapper(nn.Module):
             elif 'state_dict' in checkpoint and isinstance(checkpoint['state_dict'], dict):
                 print(f"  Checkpoint format: wrapped in 'state_dict' key")
                 state_dict = checkpoint['state_dict']
+            elif 'backbone' in checkpoint and isinstance(checkpoint['backbone'], dict):
+                # Fine-tuned model format with backbone/seg_head split
+                print(f"  Checkpoint format: wrapped in 'backbone' key (fine-tuned model)")
+                state_dict = checkpoint['backbone']
             elif 'teacher' in checkpoint and isinstance(checkpoint['teacher'], dict):
                 # DINOv1-style teacher checkpoint
                 print(f"  Checkpoint format: teacher-student (using 'teacher')")
@@ -208,22 +220,22 @@ class DINOv3Wrapper(nn.Module):
                 # Try to be more flexible - take the first dict-like value
                 print(f"  Checkpoint keys: {list(checkpoint.keys())[:10]}")
                 raise ValueError(
-                    f"Unknown checkpoint format. Expected keys: 'model', 'state_dict', 'teacher', "
+                    f"Unknown checkpoint format. Expected keys: 'model', 'state_dict', 'backbone', 'teacher', "
                     f"or direct state_dict. Got: {list(checkpoint.keys())[:5]}"
                 )
         else:
             raise ValueError(f"Checkpoint must be a dictionary, got {type(checkpoint)}")
-        
+
         # Remove common prefixes if present
         original_keys = len(state_dict)
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
-        
+
         if len(state_dict) != original_keys:
             print(f"  Removed prefixes from state_dict keys")
-        
+
         print(f"  State dict contains {len(state_dict)} keys")
-        
+
         return state_dict
     
     def _save_activation(self, module, input, output):
