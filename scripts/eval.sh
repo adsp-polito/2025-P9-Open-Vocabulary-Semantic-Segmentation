@@ -1,7 +1,7 @@
 #!/bin/sh
 export DETECTRON2_DATASETS='gs_net/data/datasets'
 # export RSIB_CKPT='dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth'
-export RSIB_CKPT='output/selfsup_finetuning/selfsup_dino_20260410_095036/backbone_for_gsnet/epoch_17.pth'
+export RSIB_CKPT='gs_net/third_party/experiments/sup_unfreeze_20260318_225917/backbone_for_gsnet/epoch_07.pth'
 # export RSIB_CKPT='gs_net/third_party/experiments/sup_lora_20260410_095040/backbone_for_gsnet/epoch_17.pth'
 
 config=$1
