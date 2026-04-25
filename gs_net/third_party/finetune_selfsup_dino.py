@@ -13,7 +13,7 @@ Pipeline:
     5. Save backbone weights for use in GSNet
 
 Output:
-    output/finetune_selfsup/selfsup_dino_<timestamp>/
+    output/selfsup_finetuning/selfsup_dino_<timestamp>/
         config.json              - All hyperparameters
         train_log.csv            - Per-epoch loss
         checkpoints/epoch_XX.pth - Full checkpoints (resumable)
@@ -23,7 +23,7 @@ Usage:
     python finetune_selfsup_dino.py
 
 Then test in GSNet:
-    export RSIB_CKPT='output/finetune_selfsup/selfsup_dino_<timestamp>/backbone_for_gsnet/epoch_XX.pth'
+    export RSIB_CKPT='output/selfsup_finetuning/selfsup_dino_<timestamp>/backbone_for_gsnet/epoch_XX.pth'
 
 Requirements:
     pip install timm torchvision tqdm numpy
@@ -75,9 +75,8 @@ import timm
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
-OUTPUT_ROOT = os.path.join(PROJECT_DIR, "output", "finetune_selfsup")
+OUTPUT_ROOT = os.path.join(PROJECT_DIR, "output", "selfsup_finetuning")
 
-# !! CHANGE THIS TO YOUR ACTUAL CHECKPOINT PATH !!
 PRETRAINED_WEIGHTS = os.path.join(
     PROJECT_DIR,
     "dinov3",
@@ -85,7 +84,6 @@ PRETRAINED_WEIGHTS = os.path.join(
     "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
 )
 
-# !! CHANGE THIS TO YOUR ACTUAL DATASET PATH !!
 DATASET_DIR = os.path.join(
     PROJECT_DIR,
     "gs_net",
@@ -100,10 +98,10 @@ IMG_SIZE = 384
 BATCH_SIZE = 1              # Physical batch size (limited by GPU memory)
 GRAD_ACCUM_STEPS = 4        # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS = 4
 WARMUP_EPOCHS = 2           # Head-only warmup (backbone frozen)
-TRAIN_EPOCHS = 5            # Backbone + head training
-TOTAL_EPOCHS = WARMUP_EPOCHS + TRAIN_EPOCHS  # 7 total (matches supervised scripts)
+TRAIN_EPOCHS = 15            # Backbone + head training
+TOTAL_EPOCHS = WARMUP_EPOCHS + TRAIN_EPOCHS  # 17 total (matches supervised scripts)
 SAVE_EVERY = 1              # Save checkpoint every N epochs after warmup
-DATA_FRACTION = 0.5         # Use 50% of dataset (~26K images, matches supervised scripts)
+DATA_FRACTION = 1         # Use 50% of dataset (~26K images, matches supervised scripts)
 DATA_SEED = 42              # Fixed seed for reproducible subset
 
 # Backbone unfreezing
@@ -598,13 +596,13 @@ def main():
             grad_accum_steps=GRAD_ACCUM_STEPS, unfreeze_backbone=True,
         )
 
-        scheduler.step()
-
         current_lr_heads = optimizer.param_groups[0]["lr"]
         current_lr_backbone = optimizer.param_groups[1]["lr"]
         print(f"  Epoch {epoch} | Loss: {avg_loss:.4f} | "
               f"LR heads: {current_lr_heads:.2e} | LR backbone: {current_lr_backbone:.2e}")
         log_epoch(exp_dir, epoch, avg_loss, "dino")
+
+        scheduler.step()
 
         # Save checkpoint and backbone for GSNet
         if (epoch - WARMUP_EPOCHS) % SAVE_EVERY == 0 or epoch == TOTAL_EPOCHS:
