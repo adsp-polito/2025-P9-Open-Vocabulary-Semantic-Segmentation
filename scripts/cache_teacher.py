@@ -71,7 +71,7 @@ def _patch_ripd(ripd_module):
     """
     original_forward = ripd_module.forward
 
-    def patched_forward(img_feats, dino_feat, text_feats, appearance_guidance, dino_guidance):
+    def patched_forward(img_feats, dino_feat, text_feats, appearance_guidance, dino_guidance, gt_cls=None):
         import torch.nn.functional as F_
         from einops import rearrange as rr
 
@@ -105,7 +105,7 @@ def _patch_ripd(ripd_module):
         _hook_state["fused_corr_embed"] = fused_corr_embed.detach().cpu().half()
 
         # ── Continue with the original remainder of forward ───────────────────
-        return original_forward(img_feats, dino_feat, text_feats, appearance_guidance, dino_guidance)
+        return original_forward(img_feats, dino_feat, text_feats, appearance_guidance, dino_guidance, gt_cls)
 
     ripd_module.forward = patched_forward
 
