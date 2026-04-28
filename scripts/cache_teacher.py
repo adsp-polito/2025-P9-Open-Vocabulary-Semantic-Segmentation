@@ -186,7 +186,7 @@ def main():
 
     # Locate RIPD module inside the model
     # GSNet.sem_seg_head.predictor → RIPD instance
-    ripd = model.sem_seg_head.predictor
+    ripd = model.sem_seg_head.predictor.transformer
     unpatch = _patch_ripd(ripd)
 
     # ── Prepare hook to capture dino_feat_L4 / dino_feat_L8 ─────────────────
