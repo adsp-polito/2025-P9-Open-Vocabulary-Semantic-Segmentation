@@ -155,7 +155,7 @@ class GSNet(nn.Module):
         self.dino_decod_proj1 = nn.Conv2d(in_channels = 768, out_channels=256, kernel_size=1, stride=1, padding=0) if self.dino_model and self.dino_decod_dim[0]!=0 else None
         self.dino_decod_proj2 = nn.ConvTranspose2d(in_channels= 768, out_channels=128, kernel_size=2, stride=2) if self.dino_model and self.dino_decod_dim[0]!=0 else None
         
-        self.dino_down_sample = nn.Conv2d(in_channels=768, out_channels=768, kernel_size=2, stride=2, padding=0) if self.dino_model else None
+        self.dino_down_sample = nn.Conv2d(in_channels=768, out_channels=512, kernel_size=2, stride=2, padding=0) if self.dino_model else None
         self.layer_indexes = [3, 7] if clip_pretrained == "ViT-B/16" or clip_pretrained == "RemoteCLIP-ViT-B-32" else [7, 15] 
         self.layers = []
         if self.use_clip:
@@ -291,7 +291,7 @@ class GSNet(nn.Module):
             # Extract patch tokens (skip CLS token at index 0)
             # Output shape: (B, 2304, 768) → (B, 768, 48, 48)
             dino_patch_feat_last_unfold = rearrange(dino_feat[-1][:,1:,:],"B (H W) C -> B C H W", H=48)
-            dino_feat_down = self.dino_down_sample(dino_patch_feat_last_unfold) # B,768,24,24
+            dino_feat_down = self.dino_down_sample(dino_patch_feat_last_unfold) # B,512,24,24
 
             # Extract intermediate layer features for decoder guidance
             dino_feat_L4 = rearrange(dino_feat[3][:,1:,:],"B (H W) C -> B C H W", H=48)

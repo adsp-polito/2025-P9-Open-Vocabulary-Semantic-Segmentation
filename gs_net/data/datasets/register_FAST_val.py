@@ -19,7 +19,7 @@ def _get_landdiscover50k_meta():
     return ret
 
 def register_FAST(root):
-    # root = os.path.join(root, "SAMRS")
+    root = os.path.join(root, "SAMRS")
     root = os.path.join(root, "FAST")
     # ValidList = os.path.join(root, "valid.txt")
     # root = '/media/zpp2/Datamy/ycy/RSSG/SAMRS/FAST/'
@@ -27,8 +27,8 @@ def register_FAST(root):
     # for name, image_dirname, sem_seg_dirname in [
     #     ("test", "images/validation", "annotations_detectron2/validation"),
     # ]:
-    for name, image_dirname, sem_seg_dirname in [
-         ("FAST", "val/images", "val/semlabels/gray"),
+    for name,image_dirname, sem_seg_dirname in [
+         ("FAST_val", "val/images", "val/semlabels/gray"),
      ]:
         image_dir = os.path.join(root, image_dirname)
         gt_dir = os.path.join(root, sem_seg_dirname)

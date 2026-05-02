@@ -24,9 +24,9 @@ def register_flair(root):
     # for name, image_dirname, sem_seg_dirname in [
     #     ("test", "images/validation", "annotations_detectron2/validation"),
     # ]:
-    root = os.path.join(root,"FLAIR_test")
+    root = os.path.join(root,"FLAIR")
     for name,image_dirname, sem_seg_dirname in [
-         ("FLAIR_test", "image", "mask"),
+         ("FLAIR_test", "test/image", "test/mask"),
      ]:
         image_dir = os.path.join(root, image_dirname)
         gt_dir = os.path.join(root, sem_seg_dirname)

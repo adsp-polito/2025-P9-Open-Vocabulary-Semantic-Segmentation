@@ -1,8 +1,6 @@
 #!/bin/sh
 export DETECTRON2_DATASETS='gs_net/data/datasets'
-# export RSIB_CKPT='dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth'
-export RSIB_CKPT='output/selfsup_finetuning/selfsup_dino_20260410_095036/backbone_for_gsnet/epoch_17.pth'
-# export RSIB_CKPT='gs_net/third_party/experiments/sup_lora_20260410_095040/backbone_for_gsnet/epoch_17.pth'
+export RSIB_CKPT='dinov3/vitl16-sat493m/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth'
 
 config=$1
 gpus=$2
@@ -28,6 +26,20 @@ fi
 
 shift 3
 opts=${@}
+
+# python3 train_net.py --config $config \
+#  --num-gpus $gpus \
+#  --dist-url "auto" \
+#  --resume \
+#  OUTPUT_DIR $output \
+#  MODEL.SEM_SEG_HEAD.IGNORE_VALUE 0 \
+#  MODEL.SEM_SEG_HEAD.NUM_CLASSES 40 \
+#  MODEL.SEM_SEG_HEAD.TRAIN_CLASS_JSON "datasets/landdiscover.json" \
+#  MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/potsdam.json" \
+#  TEST.EVAL_PERIOD 0 \
+#  DATASETS.TRAIN \(\"LandDiscover_50K\"\,\) \
+#  DATASETS.TEST \(\"potsdam_all\"\,\) \
+#  $opts
 
 # FloodNet
 python3 train_net.py --config $config \
