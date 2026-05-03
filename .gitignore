@@ -92,3 +92,5 @@ gs_net/third_party/experiments/
 gs_net/third_party/eval_output/
 LOCAL_AGENT_REFERENCE.md
 /output/
+/results/
+Local_Agen_reference.md
