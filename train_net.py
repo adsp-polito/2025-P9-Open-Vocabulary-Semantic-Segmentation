@@ -289,6 +289,13 @@ class Trainer(DefaultTrainer):
         res = OrderedDict({k + "_TTA": v for k, v in res.items()})
         return res
 
+    def build_writers(self):
+        from detectron2.utils.events import CommonMetricPrinter, JSONWriter
+        return [
+            CommonMetricPrinter(self.max_iter),
+            JSONWriter(os.path.join(self.cfg.OUTPUT_DIR, "metrics.json")),
+        ]
+
 
 def setup(args):
     """
