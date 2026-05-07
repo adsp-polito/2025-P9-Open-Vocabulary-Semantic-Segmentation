@@ -64,6 +64,7 @@ class RIPD(nn.Module):
         use_clip_corr = True,
         use_dino_corr = True,
         fusion_type = "query_guided",
+        use_uncertainty_gate = False,
         num_layers=4,
         nheads=4, 
         hidden_dim=128,
@@ -79,6 +80,10 @@ class RIPD(nn.Module):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.fusion_type = fusion_type
+        self.use_uncertainty_gate = use_uncertainty_gate
+        if use_uncertainty_gate:
+            self.prelim_head = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+            self.scale_alpha = nn.Parameter(torch.zeros(1))
         self.layers = nn.ModuleList([
             AggregatorLayer(
                 hidden_dim=hidden_dim, text_guidance_dim=text_guidance_proj_dim, appearance_guidance=appearance_guidance_proj_dim, 
@@ -241,6 +246,7 @@ class RIPD(nn.Module):
         """
 
         classes = None
+        dino_embed_corr = None
 
         if dino_feat is not None and img_feats is not None:
             if self.fusion_type == 'query_guided':
@@ -283,8 +289,17 @@ class RIPD(nn.Module):
             text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
             projected_text_guidance = self.text_guidance_projection(text_feats)
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             fused_corr_embed = layer(fused_corr_embed, projected_guidance, projected_text_guidance)
+            if self.use_uncertainty_gate and i == 0 and dino_embed_corr is not None:
+                B_g, C_g, T_g, H_g, W_g = fused_corr_embed.shape
+                prelim = self.prelim_head(rearrange(fused_corr_embed, 'B C T H W -> (B T) C H W'))
+                prelim = rearrange(prelim, '(B T) 1 H W -> B T H W', B=B_g)
+                probs = torch.softmax(prelim, dim=1)
+                entropy = -(probs * torch.log(probs + 1e-6)).sum(dim=1, keepdim=True)
+                entropy = entropy / torch.log(torch.tensor(float(T_g), device=entropy.device) + 1e-6)
+                gate = entropy.unsqueeze(2)
+                fused_corr_embed = fused_corr_embed + gate * dino_embed_corr * self.scale_alpha
 
         logit = self.Fusion_conv_decoer(fused_corr_embed, CLIP_projected_decoder_guidance,DINO_projected_decoder_guidance)
 
