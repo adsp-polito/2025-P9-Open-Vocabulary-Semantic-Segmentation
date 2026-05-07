@@ -65,6 +65,7 @@ class RIPD(nn.Module):
         use_dino_corr = True,
         fusion_type = "query_guided",
         use_uncertainty_gate = False,
+        use_fine_scale_corr = False,
         num_layers=4,
         nheads=4, 
         hidden_dim=128,
@@ -84,6 +85,11 @@ class RIPD(nn.Module):
         if use_uncertainty_gate:
             self.prelim_head = nn.Conv2d(hidden_dim, 1, kernel_size=1)
             self.scale_alpha = nn.Parameter(torch.zeros(1))
+        self.use_fine_scale_corr = use_fine_scale_corr
+        if use_fine_scale_corr:
+            self.fine_proj = nn.Conv2d(decoder_dino_guidance_dims[0], text_guidance_dim, kernel_size=1)
+            self.fine_corr_embed = nn.Conv2d(prompt_channel, hidden_dim, kernel_size=7, stride=1, padding=3)
+            self.scale_beta = nn.Parameter(torch.zeros(1))
         self.layers = nn.ModuleList([
             AggregatorLayer(
                 hidden_dim=hidden_dim, text_guidance_dim=text_guidance_proj_dim, appearance_guidance=appearance_guidance_proj_dim, 
@@ -274,6 +280,15 @@ class RIPD(nn.Module):
             corr = self.correlation(img_feats,text_feats)
             embed_corr = self.corr_embed(corr)
             fused_corr_embed = embed_corr
+
+        if self.use_fine_scale_corr and dino_guidance is not None and len(dino_guidance) > 0:
+            B_f = fused_corr_embed.shape[0]
+            fine_feat = self.fine_proj(dino_guidance[0])
+            fine_corr = self.correlation(fine_feat, text_feats)
+            fine_corr_emb = self.fine_corr_embed(rearrange(fine_corr, 'B P T H W -> (B T) P H W'))
+            fine_corr_emb = F.adaptive_avg_pool2d(fine_corr_emb, fused_corr_embed.shape[-2:])
+            fine_corr_emb = rearrange(fine_corr_emb, '(B T) C H W -> B C T H W', B=B_f)
+            fused_corr_embed = fused_corr_embed + fine_corr_emb * self.scale_beta
 
         projected_guidance, projected_text_guidance, CLIP_projected_decoder_guidance,DINO_projected_decoder_guidance  = None, None, [None, None], [None,None]
         if self.guidance_projection is not None and appearance_guidance is not None:

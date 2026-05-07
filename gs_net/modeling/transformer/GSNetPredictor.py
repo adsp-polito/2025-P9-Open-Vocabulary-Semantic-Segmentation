@@ -49,6 +49,7 @@ class GSNetPredictor(nn.Module):
         use_dino_corr: bool,
         fusion_type: str,
         use_uncertainty_gate: bool,
+        use_fine_scale_corr: bool,
         num_heads: int,
         num_layers: tuple,
         hidden_dims: tuple,
@@ -144,6 +145,7 @@ class GSNetPredictor(nn.Module):
             use_dino_corr = use_dino_corr,
             fusion_type = fusion_type,
             use_uncertainty_gate = use_uncertainty_gate,
+            use_fine_scale_corr = use_fine_scale_corr,
             num_layers=num_layers,
             nheads=num_heads, 
             hidden_dim=hidden_dims,
@@ -184,6 +186,7 @@ class GSNetPredictor(nn.Module):
         ret['use_dino_corr'] = cfg.MODEL.SEM_SEG_HEAD.USE_DINO_CORR
         ret['fusion_type'] = cfg.MODEL.SEM_SEG_HEAD.FUSION_TYPE
         ret['use_uncertainty_gate'] = cfg.MODEL.SEM_SEG_HEAD.USE_UNCERTAINTY_GATE
+        ret['use_fine_scale_corr'] = cfg.MODEL.SEM_SEG_HEAD.USE_FINE_SCALE_CORR
         ret["prompt_depth"] = cfg.MODEL.SEM_SEG_HEAD.PROMPT_DEPTH
         ret["prompt_length"] = cfg.MODEL.SEM_SEG_HEAD.PROMPT_LENGTH
 
