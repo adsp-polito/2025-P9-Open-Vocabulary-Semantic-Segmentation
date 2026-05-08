@@ -1,11 +1,13 @@
-Model,Fine tune epochs,Backbone tuned,FloodNet,FAST,Potsdam,FLAIR,Average
+Model,,Fine tune epochs,Backbone tuned,FloodNet,FAST,Potsdam,FLAIR,Average
 GSNet,original model,300,Dino_v1,42.63,16.61,45.75,20,31.2475
-GSNet,supervised_partial unfreeze,5,Dino_v3,48.4029,18.5269,27.7103,18.6474,28.321875
-GSNet,supervised_partial unfreeze,10,Dino_v3,46.3836,17.9678,26.8862,20.7949,28.008125
-GSNet,supervised_partial unfreeze,15,Dino_v3,44.9009,17.965,28.6969,19.9764,27.8848
-GSNet,Supervised_LoRA,5,Dino_v3,45.1936,17.9589,29.3377,19.9868,28.11925
-GSNet,Supervised_LoRA,10,Dino_v3,45.9992,17.6714,29.9027,18.1875,27.9402
-GSNet,Supervised_LoRA,15,Dino_v3,43.6852,17.962,26.9996,19.5688,27.0539
-GSNet,Self_Supervised,5,Dino_v3,41.39,16.7563,27.4475,19.9841,26.394475
-GSNet,Self_Supervised,10,Dino_v3,44.4225,17.2026,26.4885,19.2816,26.8488
-GSNet,Self_Supervised,15,Dino_v3,44.6493,18.1382,27.2992,18.1397,27.0566
+GSNet,supervised_partial unfreeze,5,Dino_v3,48.4029,18.5269,44.11,28.1832,34.80575
+GSNet,"supervised_partial (Uncertainty-Guided Fusion Gate )
+",5,Dino_v3,47.53,18.9,45.73,27.22,34.845
+GSNet,supervised_partial unfreeze,10,Dino_v3,46.3836,17.9678,42.4528,28.7295,28.008125
+GSNet,supervised_partial unfreeze,15,Dino_v3,44.9009,17.965,44.5279,28.9697,27.8848
+GSNet,Supervised_LoRA,5,Dino_v3,45.1936,17.9589,43.3495,28.7294,33.80785
+GSNet,Supervised_LoRA,10,Dino_v3,45.9992,17.6714,45.7584,28.1197,34.387175
+GSNet,Supervised_LoRA,15,Dino_v3,43.6852,17.962,45.5096,28.1914,33.83705
+GSNet,Self_Supervised,5,Dino_v3,41.39,16.7563,41.8347,29.4326,32.3534
+GSNet,Self_Supervised,10,Dino_v3,44.4225,17.2026,43.08,28.2031,33.22705
+GSNet,Self_Supervised,15,Dino_v3,44.6493,18.1382,44.539,27.3832,33.677425
