@@ -27,9 +27,6 @@ from typing import List
 from .utils import extract_clip_layers
 
 CLIP_LAYERS = [4, 8, 10, 12]
-CLIP_DIM = 768          # CLIP ViT-B/16 hidden dim
-NUM_CLIP_LAYERS = len(CLIP_LAYERS)
-TRUNK_IN = NUM_CLIP_LAYERS * CLIP_DIM   # 4 * 768 = 3072
 TRUNK_OUT = 512
 
 
@@ -61,7 +58,9 @@ class GSDistillStudent(nn.Module):
         self.d_dino = d_dino
         self.num_classes = num_classes
 
-        trunk_in = len(self.clip_layers) * CLIP_DIM   # 3072
+        # Infer CLIP hidden dim from the model (works for ViT-B/16=768, ViT-L/14=1024, etc.)
+        clip_dim = clip_model.visual.transformer.resblocks[0].attn.out_proj.out_features
+        trunk_in = len(self.clip_layers) * clip_dim
 
         self.shared_trunk = nn.Sequential(
             nn.Conv2d(trunk_in, TRUNK_OUT, kernel_size=3, padding=1),

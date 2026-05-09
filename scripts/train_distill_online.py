@@ -41,7 +41,6 @@ from einops import rearrange
 from tqdm import tqdm
 
 import wandb
-import clip as openai_clip
 
 from detectron2.config import get_cfg
 from detectron2.checkpoint import DetectionCheckpointer
@@ -311,7 +310,6 @@ def parse_args():
     p.add_argument("--gsnet-weights",   required=True)
     p.add_argument("--image-dir",       required=True)
     p.add_argument("--output-dir",      default="output/distill")
-    p.add_argument("--clip-pretrained", default="ViT-B/16")
     p.add_argument("--epochs",          type=int,   default=30)
     p.add_argument("--batch-size",      type=int,   default=8)
     p.add_argument("--lr",              type=float, default=1e-4)
@@ -355,8 +353,10 @@ def main():
     unpatch_dino = _patch_dino(teacher.dino_model)
 
     # ── Student ───────────────────────────────────────────────────────────────
-    print(f"Loading CLIP {args.clip_pretrained} for student ...")
-    clip_model, _ = openai_clip.load(args.clip_pretrained, device=device, jit=False)
+    # Reuse the teacher's CLIP — already the right architecture (ViT-L or ViT-B)
+    # and carrying the attention fine-tuning from the GSNet checkpoint.
+    print("Reusing teacher's fine-tuned CLIP as student backbone ...")
+    clip_model = teacher.sem_seg_head.predictor.clip_model
     clip_model.eval()
     for p in clip_model.parameters():
         p.requires_grad = False
@@ -470,6 +470,16 @@ def main():
                 "args": vars(args),
             }, best_path)
             print(f"  ✓ New best val loss: {val_loss:.4f} → {best_path}")
+
+        if (epoch + 1) % 5 == 0:
+            ckpt_path = os.path.join(args.output_dir, f"student_epoch{epoch+1:03d}.pth")
+            torch.save({
+                "epoch": epoch,
+                "student": student.state_dict(),
+                "val_loss": val_loss,
+                "args": vars(args),
+            }, ckpt_path)
+            print(f"  → Periodic checkpoint: {ckpt_path}")
 
     unpatch_ripd()
     unpatch_dino()
