@@ -52,18 +52,22 @@ class CachedLD50KDataset(Dataset):
         self.clip_mean = clip_mean or self.CLIP_MEAN
         self.clip_std  = clip_std  or self.CLIP_STD
 
-        # Collect image stems that have a matching cache file
-        cache_files = glob.glob(os.path.join(cache_dir, "*.pt"))
-        stems = [os.path.splitext(os.path.basename(f))[0] for f in cache_files]
+        # Build stem → path map from image_dir (recursive, mirrors cache_teacher.py)
+        EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+        from pathlib import Path
+        stem_to_img = {
+            p.stem: str(p)
+            for p in Path(image_dir).rglob("*")
+            if p.suffix.lower() in EXTENSIONS
+        }
 
-        # Find matching image files (support jpg / png / tif)
+        # Match against available cache files
+        cache_files = glob.glob(os.path.join(cache_dir, "*.pt"))
         self.samples = []
-        for stem in stems:
-            for ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
-                img_path = os.path.join(image_dir, stem + ext)
-                if os.path.isfile(img_path):
-                    self.samples.append((img_path, os.path.join(cache_dir, stem + ".pt")))
-                    break
+        for cache_path in cache_files:
+            stem = os.path.splitext(os.path.basename(cache_path))[0]
+            if stem in stem_to_img:
+                self.samples.append((stem_to_img[stem], cache_path))
 
         if len(self.samples) == 0:
             raise RuntimeError(

@@ -48,6 +48,24 @@ import gs_net                                  # noqa: side-effect registrations
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LD50K vocabulary — used to override whatever TEST_CLASS_JSON the config
+# points to, so fused_corr_embed is always computed against LD50K text.
+# ─────────────────────────────────────────────────────────────────────────────
+CLASSES_LandDiscover50K = [
+    'background', 'bare land', 'grass', 'pavement', 'road', 'tree', 'water',
+    'agriculture land', 'buildings', 'forest land', 'barren land', 'urban land',
+    'large-vehicle', 'swimming-pool', 'helicopter', 'bridge',
+    'plane', 'ship', 'soccer-ball-field', 'basketball-court',
+    'ground-track-field', 'small-vehicle', 'baseball-diamond',
+    'tennis-court', 'roundabout', 'storage-tank', 'harbor',
+    'container-crane', 'airport', 'helipad', 'chimney',
+    'expressway service area', 'expresswalltoll station', 'dam',
+    'golf field', 'overpass', 'stadium', 'train station',
+    'vehicle', 'windmill',
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Hook state (module-level so closures can write into it)
 # ─────────────────────────────────────────────────────────────────────────────
 _hook_state = {
@@ -162,6 +180,14 @@ def build_model(config_file, weights_file, device):
     model = d2_build_model(cfg)
     DetectionCheckpointer(model).load(weights_file)
     model.eval()
+
+    # Force the predictor to use LD50K text regardless of what TEST_CLASS_JSON
+    # in the config points to (e.g. floodnet.json).  The cache field also needs
+    # clearing so get_text_embeds() re-encodes with the correct class list.
+    predictor = model.sem_seg_head.predictor
+    predictor.test_class_texts = CLASSES_LandDiscover50K
+    predictor.cache = None
+
     return model, cfg
 
 

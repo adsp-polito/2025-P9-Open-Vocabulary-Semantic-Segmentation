@@ -21,10 +21,10 @@ def distillation_loss(pred: dict, target: dict) -> torch.Tensor:
         Scalar loss tensor.
     """
     loss = torch.tensor(0.0, device=next(iter(pred.values())).device)
-    for key in ("fused_corr_embed", "dino_L4", "dino_L8"):
+    for key in ("fused_corr_embed", "clip_embed_corr", "dino_L4", "dino_L8"):
         p = pred[key].float()
         t = target[key].float()
-        mse = F.mse_loss(p, t)
+        mse = F.smooth_l1_loss(p, t)
         cos = 1.0 - F.cosine_similarity(
             p.flatten(1),
             t.flatten(1),
@@ -43,10 +43,10 @@ def distillation_loss_per_branch(pred: dict, target: dict) -> dict:
     """
     breakdown = {}
     total = torch.tensor(0.0, device=next(iter(pred.values())).device)
-    for key in ("fused_corr_embed", "dino_L4", "dino_L8"):
+    for key in ("fused_corr_embed", "clip_embed_corr", "dino_L4", "dino_L8"):
         p = pred[key].float()
         t = target[key].float()
-        mse = F.mse_loss(p, t)
+        mse = F.smooth_l1_loss(p, t)
         cos = 1.0 - F.cosine_similarity(p.flatten(1), t.flatten(1), dim=-1).mean()
         branch_loss = mse + cos
         breakdown[key] = branch_loss.item()
