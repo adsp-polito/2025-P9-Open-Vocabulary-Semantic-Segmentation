@@ -23,6 +23,13 @@ conda activate gsnet
 export DETECTRON2_DATASETS='gs_net/data/datasets'
 export RSIB_CKPT='gs_net/third_party/experiments/sup_unfreeze_20260318_225917/backbone_for_gsnet/epoch_07.pth'
 
+# Load secrets (WANDB_API_KEY etc.) — .env is gitignored
+if [[ -f "${PROJECT_ROOT}/.env" ]]; then
+    set -o allexport
+    source "${PROJECT_ROOT}/.env"
+    set +o allexport
+fi
+
 GSNET_WEIGHTS="output/gsnet_pretrain/model_final.pth"
 
 if [[ ! -f "${GSNET_WEIGHTS}" ]]; then
