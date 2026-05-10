@@ -50,7 +50,7 @@ nvidia-smi
     --image-dir     gs_net/data/datasets/LandDiscover_50K/TR_Image \
     --output-dir    output/distill \
     --epochs        30 \
-    --batch-size    8 \
+    --batch-size    2 \
     --lr            1e-4 \
     --num-workers   4 \
     --amp \
