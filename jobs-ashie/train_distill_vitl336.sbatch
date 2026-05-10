@@ -1,11 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=distill_vitl336
-#SBATCH --account=intrn
-#SBATCH --partition=RTX
-#SBATCH --qos=preemptable
-#SBATCH --gres=gpu:2080ti:1
-#SBATCH --mem=48G
-#SBATCH --cpus-per-task=8
 #SBATCH --time=7-00:00:00
 #SBATCH --output=logs/distill_vitl336_%j.out
 #SBATCH --error=logs/distill_vitl336_%j.err

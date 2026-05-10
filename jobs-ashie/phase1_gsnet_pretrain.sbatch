@@ -1,11 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=gsnet_pretrain
-#SBATCH --account=intrn
-#SBATCH --partition=RTX
-#SBATCH --qos=preemptable
-#SBATCH --gres=gpu:2080ti:4
-#SBATCH --mem=80G
-#SBATCH --cpus-per-task=16
 #SBATCH --time=2-00:00:00
 #SBATCH --output=jobs-ashie/logs/gsnet_pretrain_%j.out
 #SBATCH --error=jobs-ashie/logs/gsnet_pretrain_%j.err
@@ -36,7 +30,7 @@ nvidia-smi
 
 sh scripts/train.sh \
     configs/vitl_336_dinov3.yaml \
-    2 \
+    1 \
     output/gsnet_pretrain \
     MODEL.SEM_SEG_HEAD.DINO_FINETUNE frozen
 
