@@ -1,14 +1,25 @@
 """
-TIPSDistillStudent — the Phase 2 student model for GS-Distill.
+TIPSDistillStudent — Phase 2 student model for GS-Distill.
 
-Architecture:
-  - Frozen TIPSv2-L/14 image encoder (ViT-L, patch_size=14)
-  - Spatial correlation map: patch_tokens (B,576,1024) @ text_embeds (T,1024)
-    → (B, T, 24, 24) cosine similarity map
-  - LightweightDecoder: (B, T, 24, 24) → (B, T, 96, 96) segmentation logits
+Architecture (inspired by CLIP-DINOiser, ECCV 2024):
+  ① Frozen TIPSv2-L/14 vision encoder → patch_tokens (B, 576, 1024)
+  ② reshape → (B, 1024, 24, 24)
+  ③ SpatialAdapter [trainable, ~0.5M params]
+       bottleneck residual: 1×1 compress → 3×3 spatial mix → 1×1 expand + residual
+       learns to inject DINOv3-like spatial structure into TIPS patch features
+  ④ L2-normalise (channel dim)
+  ⑤ einsum with frozen text_embeds (T, 1024) → correlation map (B, T, 24, 24)
+  ⑥ LightweightDecoder [trainable, ~0.5M params] → logits (B, T, 96, 96)
+
+Total trainable in Phase 2: ~1M params (adapter + decoder).
+TIPS backbone (488M) is fully frozen.
+
+What carries to Phase 3:
+  - SpatialAdapter: preserved (carries the distilled DINOv3-like knowledge)
+  - Decoder: reinitialized for K dataset classes
+  - TIPS last 4 blocks: unfrozen and fine-tuned
 
 At 336px input with patch_size=14: 336/14 = 24 patches per side → 24×24 grid.
-Text embeddings for 40 LD50K classes are pre-computed once and frozen as a buffer.
 """
 
 import torch
@@ -17,6 +28,9 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .decoder import LightweightDecoder
+
+
+# ── TIPS loader ───────────────────────────────────────────────────────────────
 
 def _load_tips(tips_dir: str):
     """Load TIPSv2Model from a local directory, bypassing AutoModel.from_pretrained.
@@ -32,15 +46,13 @@ def _load_tips(tips_dir: str):
     tips_path = Path(tips_dir).resolve()
     pkg = "tips_local"
 
-    # Create a fake package pointing at tips_path so relative imports work
     if pkg not in sys.modules:
         pkg_spec = importlib.machinery.ModuleSpec(pkg, None, is_package=True)
-        pkg_mod = importlib.util.module_from_spec(pkg_spec)
-        pkg_mod.__path__ = [str(tips_path)]
+        pkg_mod  = importlib.util.module_from_spec(pkg_spec)
+        pkg_mod.__path__    = [str(tips_path)]
         pkg_mod.__package__ = pkg
-        sys.modules[pkg] = pkg_mod
+        sys.modules[pkg]    = pkg_mod
 
-    # Load each sibling module under the fake package (order matters for imports)
     for name in ("configuration_tips", "image_encoder", "text_encoder", "modeling_tips"):
         full_name = f"{pkg}.{name}"
         if full_name not in sys.modules:
@@ -63,11 +75,11 @@ def _load_tips(tips_dir: str):
 
     config = TIPSv2Config(**cfg_dict)
     model  = TIPSv2Model(config)
-
-    state_dict = load_file(str(tips_path / "model.safetensors"))
-    model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict(load_file(str(tips_path / "model.safetensors")), strict=True)
     return model
 
+
+# ── LD50K class list ──────────────────────────────────────────────────────────
 
 LD50K_CLASSES = [
     "background", "bare land", "grass", "pavement", "road",
@@ -81,13 +93,48 @@ LD50K_CLASSES = [
 ]
 
 
+# ── Spatial Adapter ───────────────────────────────────────────────────────────
+
+class SpatialAdapter(nn.Module):
+    """Bottleneck residual adapter on top of TIPS patch features.
+
+    Learns to inject DINOv3-like spatial structure (local patch correspondence,
+    fine-grained boundaries) into TIPS features, inspired by CLIP-DINOiser
+    (Wysoczańska et al., ECCV 2024).
+
+    Architecture: 1×1 compress → 3×3 spatial mix → 1×1 expand + residual.
+    The residual ensures training starts from unchanged TIPS features and
+    the adapter can only improve spatial quality, never hurt text alignment.
+
+    ~0.5M params for embed_dim=1024, bottleneck=256.
+    """
+
+    def __init__(self, embed_dim: int = 1024, bottleneck: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(embed_dim, bottleneck, kernel_size=1),
+            nn.GroupNorm(8, bottleneck),
+            nn.GELU(),
+            nn.Conv2d(bottleneck, bottleneck, kernel_size=3, padding=1),
+            nn.GroupNorm(8, bottleneck),
+            nn.GELU(),
+            nn.Conv2d(bottleneck, embed_dim, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+
+# ── Student model ─────────────────────────────────────────────────────────────
+
 class TIPSDistillStudent(nn.Module):
     """
     Args:
-        tips_dir:    path to TIPSv2-L/14 model directory (loaded via AutoModel).
-        num_classes: number of vocabulary classes (40 for LD50K).
+        tips_dir:    path to TIPSv2-L/14 model directory.
+        num_classes: vocabulary size (40 for LD50K).
         hidden:      LightweightDecoder hidden channels (128).
-        class_texts: list of class name strings; defaults to LD50K_CLASSES if None.
+        bottleneck:  SpatialAdapter bottleneck channels (256).
+        class_texts: class name strings; defaults to LD50K_CLASSES if None.
     """
 
     def __init__(
@@ -95,6 +142,7 @@ class TIPSDistillStudent(nn.Module):
         tips_dir: str,
         num_classes: int = 40,
         hidden: int = 128,
+        bottleneck: int = 256,
         class_texts: list = None,
     ):
         super().__init__()
@@ -105,33 +153,42 @@ class TIPSDistillStudent(nn.Module):
             p.requires_grad = False
         self.tips = tips
 
+        self.adapter = SpatialAdapter(embed_dim=1024, bottleneck=bottleneck)
         self.decoder = LightweightDecoder(num_classes=num_classes, hidden=hidden)
 
         texts = class_texts if class_texts is not None else LD50K_CLASSES[:num_classes]
         with torch.no_grad():
-            embeds = tips.encode_text(texts)  # (T, 1024)
+            embeds = tips.encode_text(texts)       # (T, 1024)
             embeds = F.normalize(embeds, dim=-1)
-        self.register_buffer("text_embeds", embeds)  # (T, D) frozen
+        self.register_buffer("text_embeds", embeds)  # (T, 1024) frozen
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            image:  (B, 3, H, W) in [0, 1] range, resized to 336×336.
+            image: (B, 3, H, W) in [0, 1], resized to 336×336.
 
         Returns:
-            logits: (B, T, 96, 96) segmentation logits.
+            logits: (B, T, 96, 96)
         """
         with torch.no_grad():
             _, _, patch_tokens = self.tips.vision_encoder(image)
-            # patch_tokens: (B, N, D) = (B, 576, 1024)
+            # patch_tokens: (B, 576, 1024)
 
-        patch_feats = rearrange(patch_tokens, "B (H W) D -> B D H W", H=24, W=24)
-        patch_feats = F.normalize(patch_feats, dim=1)  # L2-norm along channel dim
+        # ① reshape to spatial feature map
+        x = rearrange(patch_tokens, "B (H W) D -> B D H W", H=24, W=24)
 
-        # Cosine similarity: (B, D, H, W) × (T, D) → (B, T, H, W)
-        corr = torch.einsum("b d h w, t d -> b t h w", patch_feats, self.text_embeds)
+        # ② adapter: learn DINOv3-like spatial structure
+        x = self.adapter(x)                                    # (B, 1024, 24, 24)
 
-        return self.decoder(corr)  # (B, T, 96, 96)
+        # ③ L2-normalise for cosine similarity
+        x = F.normalize(x, dim=1)
+
+        # ④ correlation with class text embeddings
+        corr = torch.einsum("b d h w, t d -> b t h w", x, self.text_embeds)  # (B, T, 24, 24)
+
+        # ⑤ upsample to 96×96
+        return self.decoder(corr)                              # (B, T, 96, 96)
 
     def trainable_parameters(self):
-        return list(self.decoder.parameters())
+        """Adapter + decoder only — TIPS backbone excluded."""
+        return list(self.adapter.parameters()) + list(self.decoder.parameters())

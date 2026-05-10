@@ -55,6 +55,8 @@ def parse_args():
     p.add_argument("--tau",           type=float, default=4.0,  help="Distillation temperature")
     p.add_argument("--num-classes",   type=int,   default=40)
     p.add_argument("--hidden-dim",    type=int,   default=128)
+    p.add_argument("--bottleneck",    type=int,   default=256,
+                   help="SpatialAdapter bottleneck channels (default 256)")
     p.add_argument("--resolution",    type=int,   default=336)
     p.add_argument("--val-fraction",  type=float, default=0.05)
     p.add_argument("--num-workers",   type=int,   default=4)
@@ -140,6 +142,7 @@ def main():
         tips_dir=args.tips_dir,
         num_classes=args.num_classes,
         hidden=args.hidden_dim,
+        bottleneck=args.bottleneck,
     ).to(device)
 
     n_trainable = sum(p.numel() for p in student.trainable_parameters())
