@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 mkdir -p jobs-ashie/logs
 
-if [[ "${1:-}" == "--phase2-only" ]]; then
+if [ "${1:-}" = "--phase2-only" ]; then
     echo "Skipping Phase 1 — submitting Phase 2 directly."
     JOB2=$(sbatch --parsable jobs-ashie/phase2_distill_online.sbatch)
     echo "Phase 2 submitted: job ${JOB2}"

@@ -1,5 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=gsnet_pretrain
+#SBATCH --account=intrn
+#SBATCH --partition=RTX
+#SBATCH --qos=preemptable
+#SBATCH --gres=gpu:2080ti:1
+#SBATCH --mem=48G
+#SBATCH --cpus-per-task=8
 #SBATCH --time=2-00:00:00
 #SBATCH --output=jobs-ashie/logs/gsnet_pretrain_%j.out
 #SBATCH --error=jobs-ashie/logs/gsnet_pretrain_%j.err
