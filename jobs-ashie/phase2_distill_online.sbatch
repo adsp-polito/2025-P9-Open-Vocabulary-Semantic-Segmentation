@@ -1,5 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=distill_online
+#SBATCH --account=intrn
+#SBATCH --partition=RTX
+#SBATCH --qos=preemptable
+#SBATCH --gres=gpu:2080ti:1
+#SBATCH --mem=32G
 #SBATCH --time=3-00:00:00
 #SBATCH --output=jobs-ashie/logs/distill_online_%j.out
 #SBATCH --error=jobs-ashie/logs/distill_online_%j.err
