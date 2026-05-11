@@ -1,30 +1,29 @@
 """
-Phase 4 (optional) — End-to-end fine-tune of student + RIPD on LD50K segmentation labels.
+Phase 3 — Fine-tune the distilled student on LD50K with GT supervision.
 
-Loads:
-  - trained student conv head (from distillation checkpoint)
-  - frozen RIPD from GSNet checkpoint (optionally unfrozen)
+Mixed loss:
+  L = λ × L_distill  +  (1-λ) × L_gt
+  L_distill = temperature-scaled BCE vs cached teacher logits (40-class, 96x96)
+  L_gt      = CrossEntropy vs LD50K GT masks (40-class, resized to 96x96)
 
-Trains end-to-end on LD50K with cross-entropy segmentation loss.
-CLIP stays frozen throughout.
+Unfreezes TIPS last N blocks (default 4) at a lower LR than adapter+decoder.
+
+For the from-scratch ablation baseline, pass --no-distill-init: adapter and
+decoder are randomly initialised while TIPS still loads its pretrained weights.
+
+Results saved under output-dir/distilled/ or output-dir/scratch/.
+Eval is run separately via eval_zeroshot.py with the Phase 3 checkpoint.
 
 Usage:
-    export RSIB_CKPT='path/to/dinov3.pth'   # still needed to load GSNet; RSIB stays frozen
-
     python scripts/train_finetune.py \\
-        --gsnet-config    configs/vitb_384.yaml \\
-        --gsnet-weights   path/to/gsnet_checkpoint.pth \\
-        --student-ckpt    output/distill/student_best.pth \\
-        --image-dir       path/to/LD50K/images \\
-        --label-dir       path/to/LD50K/labels \\
-        --class-json      datasets/landdiscover.json \\
-        --output-dir      output/finetune/ \\
-        [--epochs 10] \\
-        [--batch-size 8] \\
-        [--lr 1e-5] \\
-        [--unfreeze-ripd] \\
-        [--amp] \\
-        [--device cuda]
+        --checkpoint  output/distill/student_best.pth \\
+        --tips-dir    checkpoints/tipsv2-l14 \\
+        --image-dir   gs_net/data/datasets/LandDiscover_50K/TR_Image \\
+        --gt-dir      gs_net/data/datasets/LandDiscover_50K/GT_ID \\
+        --cache-dir   cache_logits/ \\
+        --output-dir  output/finetune \\
+        [--no-distill-init]
+        [--epochs 10] [--batch-size 8] [--lr 1e-4] [--backbone-lr 1e-5] [--amp]
 """
 
 import sys, os
@@ -32,309 +31,406 @@ sys.path.insert(0, os.path.abspath('./detectron2'))
 sys.path.insert(0, os.path.abspath('.'))
 
 import argparse
+import importlib
+import importlib.machinery
+import importlib.util
 import json
+import math
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-import torchvision.transforms.functional as TF
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
-import clip as openai_clip
 
-from detectron2.config import get_cfg
-from detectron2.checkpoint import DetectionCheckpointer
+# ── Model components ──────────────────────────────────────────────────────────
 
-from gs_distill.student import GSDistillStudent
-from gs_distill.inference import gs_distill_inference
+class SpatialAdapter(nn.Module):
+    def __init__(self, embed_dim=1024, bottleneck=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(embed_dim, bottleneck, kernel_size=1),
+            nn.GroupNorm(8, bottleneck),
+            nn.GELU(),
+            nn.Conv2d(bottleneck, bottleneck, kernel_size=3, padding=1),
+            nn.GroupNorm(8, bottleneck),
+            nn.GELU(),
+            nn.Conv2d(bottleneck, embed_dim, kernel_size=1),
+        )
+
+    def forward(self, x):
+        return x + self.net(x)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Segmentation dataset
-# ─────────────────────────────────────────────────────────────────────────────
+class LightweightDecoder(nn.Module):
+    def __init__(self, num_classes=40, hidden=128):
+        super().__init__()
+        half, quarter = hidden // 2, hidden // 4
+        self.net = nn.Sequential(
+            nn.Conv2d(num_classes, hidden, 3, padding=1),
+            nn.GroupNorm(8, hidden),
+            nn.GELU(),
+            nn.ConvTranspose2d(hidden, half, 2, stride=2),
+            nn.GroupNorm(8, half),
+            nn.GELU(),
+            nn.Conv2d(half, half, 3, padding=1),
+            nn.GroupNorm(8, half),
+            nn.GELU(),
+            nn.ConvTranspose2d(half, quarter, 2, stride=2),
+            nn.GroupNorm(4, quarter),
+            nn.GELU(),
+            nn.Conv2d(quarter, num_classes, 3, padding=1),
+        )
 
-class SegDataset(Dataset):
+    def forward(self, x):
+        return self.net(x)
+
+
+def _load_tips(tips_dir: str):
+    tips_path = Path(tips_dir)
+    pkg = "tips_local"
+    if pkg not in sys.modules:
+        pkg_mod = importlib.util.module_from_spec(
+            importlib.machinery.ModuleSpec(pkg, None, is_package=True)
+        )
+        pkg_mod.__path__ = [str(tips_path)]
+        pkg_mod.__package__ = pkg
+        sys.modules[pkg] = pkg_mod
+
+    def _load_module(name):
+        full_name = f"{pkg}.{name}"
+        if full_name in sys.modules:
+            return sys.modules[full_name]
+        spec = importlib.util.spec_from_file_location(
+            full_name, str(tips_path / f"{name}.py"),
+            submodule_search_locations=[str(tips_path)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        mod.__package__ = pkg
+        sys.modules[full_name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    _load_module("configuration_tips")
+    _load_module("image_encoder")
+    _load_module("text_encoder")
+    tips_mod = _load_module("modeling_tips")
+    config_mod = sys.modules[f"{pkg}.configuration_tips"]
+    config = config_mod.TIPSv2Config.from_pretrained(tips_dir)
+    return tips_mod.TIPSv2Model(config)
+
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+
+class LD50KFinetuneDataset(Dataset):
     """
-    Flat-folder RGB image + single-channel label dataset.
-    Label pixels are class indices in [0, num_classes-1]; 255 = ignore.
+    Returns (image, gt_mask_96, teacher_logits) triples from LD50K.
+      image:           (3, 336, 336) float32 in [0, 1]
+      gt_mask_96:      (96, 96)      int64   class labels 0-39
+      teacher_logits:  (40, 96, 96)  float32
     """
     EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
-    def __init__(self, image_dir, label_dir, resolution=384,
-                 clip_mean=(0.48145466, 0.4578275, 0.40821073),
-                 clip_std=(0.26862954, 0.26130258, 0.27577711)):
+    def __init__(self, image_dir, gt_dir, cache_dir, resolution=336, gt_size=96):
         self.resolution = resolution
-        self.clip_mean = clip_mean
-        self.clip_std  = clip_std
+        self.gt_size    = gt_size
 
-        img_stems = {
-            p.stem for p in Path(image_dir).rglob("*")
-            if p.suffix.lower() in self.EXTENSIONS
-        }
-        lbl_stems = {
-            p.stem for p in Path(label_dir).rglob("*")
-            if p.suffix.lower() in self.EXTENSIONS
-        }
-        stems = sorted(img_stems & lbl_stems)
+        img_map   = {p.stem: p for p in Path(image_dir).iterdir()
+                     if p.suffix.lower() in self.EXTENSIONS}
+        gt_map    = {p.stem: p for p in Path(gt_dir).iterdir()
+                     if p.suffix.lower() in self.EXTENSIONS}
+        cache_map = {p.stem: p for p in Path(cache_dir).glob("*.pt")}
 
-        self.samples = []
-        for stem in stems:
-            for ext in (".png", ".jpg", ".tif"):
-                ip = Path(image_dir) / (stem + ext)
-                lp = Path(label_dir) / (stem + ext)
-                if ip.exists() and lp.exists():
-                    self.samples.append((str(ip), str(lp)))
-                    break
-
-        if not self.samples:
-            raise RuntimeError(f"No matching image/label pairs in {image_dir} / {label_dir}")
+        common = set(img_map) & set(gt_map) & set(cache_map)
+        if not common:
+            raise RuntimeError(
+                f"No three-way matches.\n"
+                f"  images={len(img_map)} gts={len(gt_map)} caches={len(cache_map)}"
+            )
+        self.samples = [(img_map[s], gt_map[s], cache_map[s]) for s in sorted(common)]
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, lbl_path = self.samples[idx]
+        img_path, gt_path, cache_path = self.samples[idx]
+
         img = Image.open(img_path).convert("RGB")
-        img = TF.resize(img, (self.resolution, self.resolution))
-        img = TF.to_tensor(img)
-        img = TF.normalize(img, mean=self.clip_mean, std=self.clip_std)
+        img = img.resize((self.resolution, self.resolution), Image.BILINEAR)
+        image = torch.from_numpy(np.array(img)).float() / 255.0
+        image = image.permute(2, 0, 1)
 
-        lbl = Image.open(lbl_path)
-        lbl = TF.resize(lbl, (self.resolution, self.resolution), interpolation=TF.InterpolationMode.NEAREST)
-        lbl = torch.from_numpy(
-            torch.ByteTensor(torch.ByteStorage.from_buffer(lbl.tobytes())).numpy()
-        ).long()
-        if lbl.dim() == 1:
-            lbl = lbl.view(self.resolution, self.resolution)
-        return img, lbl
+        gt = Image.open(gt_path).convert("L")
+        gt = gt.resize((self.gt_size, self.gt_size), Image.NEAREST)
+        gt_mask = torch.from_numpy(np.array(gt)).long()
+
+        cache = torch.load(cache_path, map_location="cpu", weights_only=True)
+        teacher_logits = cache["logits"].float()
+
+        return image, gt_mask, teacher_logits
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Loss ──────────────────────────────────────────────────────────────────────
+
+def mixed_loss(student_logits, teacher_logits, gt_mask, tau=4.0, lam=0.5):
+    t_soft    = torch.sigmoid(teacher_logits / tau)
+    s_soft    = student_logits / tau
+    l_distill = F.binary_cross_entropy_with_logits(s_soft, t_soft) * (tau ** 2)
+    l_gt      = F.cross_entropy(student_logits, gt_mask, ignore_index=255)
+    return lam * l_distill + (1.0 - lam) * l_gt, l_distill.item(), l_gt.item()
+
+
+# ── LR schedule ───────────────────────────────────────────────────────────────
+
+def cosine_lr(optimizer, epoch, total_epochs, base_lrs, min_lr=1e-7):
+    scale = 0.5 * (1 + math.cos(math.pi * epoch / max(1, total_epochs)))
+    for pg, base in zip(optimizer.param_groups, base_lrs):
+        pg["lr"] = min_lr + (base - min_lr) * scale
+
+
+# ── Epoch runner ──────────────────────────────────────────────────────────────
+
+def run_epoch(tips, adapter, decoder, text_emb, loader,
+              optimizer, scaler, device, amp, tau, lam, train=True):
+    tips.train(train)
+    adapter.train(train)
+    decoder.train(train)
+    ctx = torch.enable_grad() if train else torch.no_grad()
+
+    total, d_sum, g_sum, n = 0.0, 0.0, 0.0, 0
+    with ctx:
+        for images, gt_masks, teacher_logits in tqdm(
+            loader, desc="train" if train else "val ", leave=False
+        ):
+            images         = images.to(device, non_blocking=True)
+            gt_masks       = gt_masks.to(device, non_blocking=True)
+            teacher_logits = teacher_logits.to(device, non_blocking=True)
+
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+
+            with autocast(enabled=amp):
+                out     = tips.encode_image(images)
+                patches = out.patch_tokens.float()
+                B, N, D = patches.shape
+                H = W   = int(N ** 0.5)
+                feats   = patches.permute(0, 2, 1).reshape(B, D, H, W)
+                feats   = adapter(feats)
+                feats   = F.normalize(feats, dim=1)
+                corr    = torch.einsum("b d h w, t d -> b t h w", feats, text_emb)
+                logits  = decoder(corr)
+                loss, ld, lg = mixed_loss(logits, teacher_logits, gt_masks, tau, lam)
+
+            if train:
+                if amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(
+                        list(adapter.parameters()) + list(decoder.parameters()), 1.0
+                    )
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(adapter.parameters()) + list(decoder.parameters()), 1.0
+                    )
+                    optimizer.step()
+
+            total += loss.item()
+            d_sum += ld
+            g_sum += lg
+            n += 1
+
+    return total / max(n, 1), d_sum / max(n, 1), g_sum / max(n, 1)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--gsnet-config",   required=True)
-    p.add_argument("--gsnet-weights",  required=True)
-    p.add_argument("--student-ckpt",   required=True)
-    p.add_argument("--image-dir",      required=True)
-    p.add_argument("--label-dir",      required=True)
-    p.add_argument("--class-json",     default="datasets/landdiscover.json")
-    p.add_argument("--output-dir",     default="output/finetune")
-    p.add_argument("--epochs",         type=int,   default=10)
-    p.add_argument("--batch-size",     type=int,   default=8)
-    p.add_argument("--lr",             type=float, default=1e-5)
-    p.add_argument("--weight-decay",   type=float, default=1e-4)
-    p.add_argument("--unfreeze-ripd",  action="store_true")
-    p.add_argument("--amp",            action="store_true")
-    p.add_argument("--num-workers",    type=int,   default=4)
-    p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--val-fraction",   type=float, default=0.05)
+    p.add_argument("--checkpoint",      default="output/distill/student_best.pth")
+    p.add_argument("--tips-dir",        default="checkpoints/tipsv2-l14")
+    p.add_argument("--image-dir",       required=True)
+    p.add_argument("--gt-dir",          required=True)
+    p.add_argument("--cache-dir",       required=True)
+    p.add_argument("--output-dir",      default="output/finetune")
+    p.add_argument("--no-distill-init", action="store_true",
+                   help="Random adapter+decoder init (scratch ablation)")
+    p.add_argument("--epochs",          type=int,   default=10)
+    p.add_argument("--batch-size",      type=int,   default=8)
+    p.add_argument("--lr",              type=float, default=1e-4)
+    p.add_argument("--backbone-lr",     type=float, default=1e-5)
+    p.add_argument("--unfreeze-blocks", type=int,   default=4)
+    p.add_argument("--tau",             type=float, default=4.0)
+    p.add_argument("--lam",             type=float, default=0.5)
+    p.add_argument("--weight-decay",    type=float, default=1e-4)
+    p.add_argument("--val-fraction",    type=float, default=0.05)
+    p.add_argument("--num-workers",     type=int,   default=6)
+    p.add_argument("--resolution",      type=int,   default=336)
+    p.add_argument("--num-classes",     type=int,   default=40)
+    p.add_argument("--amp",             action="store_true")
+    p.add_argument("--device",          default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
 
-def build_gsnet(config_file, weights_file, device):
-    from gs_net import add_cat_seg_config
-    cfg = get_cfg()
-    add_cat_seg_config(cfg)
-    cfg.merge_from_file(config_file)
-    cfg.MODEL.DEVICE = device
-    cfg.freeze()
-    from detectron2.modeling import build_model as d2_build
-    model = d2_build(cfg)
-    DetectionCheckpointer(model).load(weights_file)
-    model.eval()
-    return model
-
-
-def build_text_features(class_json, clip_model, device):
-    with open(class_json) as f:
-        class_names = json.load(f)
-    templates = ["a photo of a {}."]
-    all_feats = []
-    with torch.no_grad():
-        for name in class_names:
-            texts = [t.format(name) for t in templates]
-            tokens = openai_clip.tokenize(texts).to(device)
-            feats = clip_model.encode_text(tokens).float()  # (P, C)
-            feats = feats / feats.norm(dim=-1, keepdim=True)
-            all_feats.append(feats)
-    # (T, P, C) → (1, T, P, C) batch dim
-    text_feats = torch.stack(all_feats, dim=0).unsqueeze(0)
-    return text_feats   # (1, T, P, C)
-
-
 def main():
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
-    device = torch.device(args.device)
+    args    = parse_args()
+    tag     = "scratch" if args.no_distill_init else "distilled"
+    out_dir = Path(args.output_dir) / tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+    device  = torch.device(args.device)
 
-    # ── Load CLIP ────────────────────────────────────────────────────────────
-    print("Loading CLIP ...")
-    clip_model, _ = openai_clip.load("ViT-B/16", device=device, jit=False)
-    clip_model.eval()
-    for p in clip_model.parameters():
-        p.requires_grad = False
+    print(f"Phase 3 fine-tuning — init: {tag.upper()}")
+    print(f"Output: {out_dir}\n")
 
-    # ── Load GSNet (to extract RIPD + projection layers) ─────────────────────
-    print("Loading GSNet ...")
-    gsnet = build_gsnet(args.gsnet_config, args.gsnet_weights, str(device))
-    gsnet = gsnet.to(device)
+    # ── Load TIPS ─────────────────────────────────────────────────────────────
+    print(f"Loading TIPS from {args.tips_dir} ...")
+    ckpt   = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    sd     = ckpt["student"]
+    tips   = _load_tips(args.tips_dir)
+    tips_sd = {k[len("tips."):]: v for k, v in sd.items() if k.startswith("tips.")}
+    tips.load_state_dict(tips_sd, strict=True)
+    tips.to(device)
 
-    ripd            = gsnet.sem_seg_head.predictor
-    clip_upsample1  = gsnet.upsample1
-    clip_upsample2  = gsnet.upsample2
-    dino_decod_proj1 = gsnet.dino_decod_proj1
-    dino_decod_proj2 = gsnet.dino_decod_proj2
+    for param in tips.parameters():
+        param.requires_grad = False
+    total_blocks  = len(tips.vision_encoder.blocks)
+    unfreeze_from = total_blocks - args.unfreeze_blocks
+    for i in range(unfreeze_from, total_blocks):
+        for param in tips.vision_encoder.blocks[i].parameters():
+            param.requires_grad = True
 
-    if not args.unfreeze_ripd:
-        for p in ripd.parameters():
-            p.requires_grad = False
+    n_backbone = sum(p.numel() for p in tips.parameters() if p.requires_grad)
+    print(f"  TIPS last {args.unfreeze_blocks} blocks unfrozen: {n_backbone/1e6:.1f}M params")
+
+    # ── Adapter & Decoder ─────────────────────────────────────────────────────
+    adapter = SpatialAdapter(embed_dim=1024, bottleneck=256).to(device)
+    decoder = LightweightDecoder(num_classes=args.num_classes, hidden=128).to(device)
+
+    if not args.no_distill_init:
+        adapter.load_state_dict(
+            {k[len("adapter."):]: v for k, v in sd.items() if k.startswith("adapter.")},
+            strict=True
+        )
+        decoder.load_state_dict(
+            {k[len("decoder."):]: v for k, v in sd.items() if k.startswith("decoder.")},
+            strict=True
+        )
+        print("  Adapter + Decoder: loaded from checkpoint")
     else:
-        print("  RIPD unfrozen for fine-tuning.")
+        print("  Adapter + Decoder: randomly initialised (scratch baseline)")
 
-    # ── Load student ─────────────────────────────────────────────────────────
-    print(f"Loading student from {args.student_ckpt} ...")
-    ckpt = torch.load(args.student_ckpt, map_location=device)
-    student_args = ckpt.get("args", {})
-    student = GSDistillStudent(
-        clip_model=clip_model,
-        hidden_dim=student_args.get("hidden_dim", 128),
-        d_dino=student_args.get("d_dino", 768),
-        num_classes=student_args.get("num_classes", 40),
-        clip_layers=student_args.get("clip_layers", [4, 8, 10, 12]),
-    ).to(device)
-    student.load_state_dict(ckpt["student"])
+    # ── Text embeddings (40 LD50K classes, pre-computed once) ─────────────────
+    ld50k_classes = json.load(open("datasets/landdiscover.json"))
+    with torch.no_grad():
+        text_emb = tips.encode_text(ld50k_classes)
+        text_emb = F.normalize(text_emb.float(), dim=-1).to(device)
+    print(f"  Text embeddings pre-computed: {text_emb.shape}")
 
-    # ── Text features (frozen) ────────────────────────────────────────────────
-    text_feats = build_text_features(args.class_json, clip_model, device)
+    n_head      = sum(p.numel() for p in adapter.parameters()) + \
+                  sum(p.numel() for p in decoder.parameters())
+    print(f"  Total trainable: {(n_backbone + n_head)/1e6:.2f}M params\n")
 
-    # ── Dataset ───────────────────────────────────────────────────────────────
-    full_ds = SegDataset(args.image_dir, args.label_dir)
+    # ── Data ──────────────────────────────────────────────────────────────────
+    print("Building dataset ...")
+    full_ds = LD50KFinetuneDataset(
+        args.image_dir, args.gt_dir, args.cache_dir, args.resolution
+    )
     n_val   = max(1, int(len(full_ds) * args.val_fraction))
     n_train = len(full_ds) - n_val
-    gen = torch.Generator().manual_seed(42)
-    from torch.utils.data import random_split
-    train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=gen)
+    train_ds, val_ds = random_split(
+        full_ds, [n_train, n_val], generator=torch.Generator().manual_seed(42)
+    )
+    print(f"  Train: {n_train}  Val: {n_val}")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
                               num_workers=args.num_workers, pin_memory=True)
 
-    print(f"  Train: {n_train}  Val: {n_val}")
-
     # ── Optimizer ─────────────────────────────────────────────────────────────
-    params = list(student.trainable_parameters())
-    if args.unfreeze_ripd:
-        params += list(ripd.parameters())
-
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-    scaler    = GradScaler(enabled=args.amp)
-    ignore_idx = 255
-
-    best_val_loss = float("inf")
+    optimizer = torch.optim.AdamW([
+        {"params": [p for p in tips.parameters() if p.requires_grad],
+         "lr": args.backbone_lr},
+        {"params": list(adapter.parameters()) + list(decoder.parameters()),
+         "lr": args.lr},
+    ], weight_decay=args.weight_decay)
+    base_lrs = [args.backbone_lr, args.lr]
+    scaler   = GradScaler(enabled=args.amp)
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    for epoch in range(args.epochs):
-        student.train()
-        if args.unfreeze_ripd:
-            ripd.train()
+    log           = []
+    best_val_loss = float("inf")
+    best_epoch    = 0
 
-        train_loss = 0.0
-        n_train_batches = 0
+    for epoch in range(1, args.epochs + 1):
+        cosine_lr(optimizer, epoch - 1, args.epochs, base_lrs)
+        lrs = [pg["lr"] for pg in optimizer.param_groups]
 
-        for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [train]"):
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            B = images.shape[0]
-            tf = text_feats.expand(B, -1, -1, -1)   # (B, T, P, C)
+        t0 = time.time()
+        tr_loss, tr_d, tr_g = run_epoch(
+            tips, adapter, decoder, text_emb,
+            train_loader, optimizer, scaler, device, args.amp,
+            args.tau, args.lam, train=True
+        )
+        vl_loss, vl_d, vl_g = run_epoch(
+            tips, adapter, decoder, text_emb,
+            val_loader, optimizer, scaler, device, args.amp,
+            args.tau, args.lam, train=False
+        )
+        elapsed = time.time() - t0
+        is_best = vl_loss < best_val_loss
 
-            optimizer.zero_grad(set_to_none=True)
+        ckpt_data = {
+            "epoch": epoch, "tag": tag,
+            "tips": tips.state_dict(),
+            "adapter": adapter.state_dict(),
+            "decoder": decoder.state_dict(),
+            "val_loss": vl_loss,
+            "args": vars(args),
+        }
+        if is_best:
+            best_val_loss = vl_loss
+            best_epoch    = epoch
+            torch.save(ckpt_data, out_dir / "student_best.pth")
+        torch.save(ckpt_data, out_dir / "student_latest.pth")
 
-            with autocast(enabled=args.amp):
-                logit = gs_distill_inference(
-                    image=images,
-                    text_feats=tf,
-                    student=student,
-                    clip_model=clip_model,
-                    ripd=ripd,
-                    clip_upsample1=clip_upsample1,
-                    clip_upsample2=clip_upsample2,
-                    dino_decod_proj1=dino_decod_proj1,
-                    dino_decod_proj2=dino_decod_proj2,
-                )
-                # logit: (B, T, H, W)  labels: (B, H, W)
-                logit_up = F.interpolate(logit, size=labels.shape[-2:],
-                                         mode="bilinear", align_corners=False)
-                loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx)
-
-            if args.amp:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(params, 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                nn.utils.clip_grad_norm_(params, 1.0)
-                optimizer.step()
-
-            train_loss += loss.item()
-            n_train_batches += 1
-
-        # Validation
-        student.eval()
-        if args.unfreeze_ripd:
-            ripd.eval()
-        val_loss = 0.0
-        n_val_batches = 0
-        with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [val]"):
-                images = images.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
-                B = images.shape[0]
-                tf = text_feats.expand(B, -1, -1, -1)
-                with autocast(enabled=args.amp):
-                    logit = gs_distill_inference(
-                        image=images, text_feats=tf, student=student,
-                        clip_model=clip_model, ripd=ripd,
-                        clip_upsample1=clip_upsample1, clip_upsample2=clip_upsample2,
-                        dino_decod_proj1=dino_decod_proj1, dino_decod_proj2=dino_decod_proj2,
-                    )
-                    logit_up = F.interpolate(logit, size=labels.shape[-2:],
-                                             mode="bilinear", align_corners=False)
-                    loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx)
-                val_loss += loss.item()
-                n_val_batches += 1
-
-        avg_train = train_loss / max(n_train_batches, 1)
-        avg_val   = val_loss   / max(n_val_batches,   1)
-        print(f"Epoch {epoch+1:3d}/{args.epochs}  train={avg_train:.4f}  val={avg_val:.4f}")
-
-        torch.save({
+        entry = {
             "epoch": epoch,
-            "student": student.state_dict(),
-            "ripd": ripd.state_dict() if args.unfreeze_ripd else None,
-            "val_loss": avg_val,
-        }, os.path.join(args.output_dir, "finetune_latest.pth"))
+            "backbone_lr": lrs[0], "head_lr": lrs[1],
+            "train_loss": round(tr_loss, 6),
+            "train_distill": round(tr_d, 6), "train_gt": round(tr_g, 6),
+            "val_loss": round(vl_loss, 6),
+            "val_distill": round(vl_d, 6), "val_gt": round(vl_g, 6),
+            "is_best": is_best, "epoch_time_s": round(elapsed, 1),
+        }
+        log.append(entry)
+        print(
+            f"Ep {epoch:2d}/{args.epochs}  "
+            f"bb_lr={lrs[0]:.1e}  head_lr={lrs[1]:.1e}  "
+            f"train={tr_loss:.4f}(d={tr_d:.3f} gt={tr_g:.3f})  "
+            f"val={vl_loss:.4f}(d={vl_d:.3f} gt={vl_g:.3f})  "
+            f"{'BEST' if is_best else '    '}  {elapsed:.0f}s"
+        )
 
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
-            best_path = os.path.join(args.output_dir, "finetune_best.pth")
-            torch.save({
-                "epoch": epoch,
-                "student": student.state_dict(),
-                "ripd": ripd.state_dict() if args.unfreeze_ripd else None,
-                "val_loss": avg_val,
-            }, best_path)
-            print(f"  ✓ New best val loss: {avg_val:.4f} → {best_path}")
+    # ── Save log ──────────────────────────────────────────────────────────────
+    with open(out_dir / "training_log.json", "w") as f:
+        json.dump({
+            "run_settings": vars(args), "tag": tag,
+            "best_epoch": best_epoch, "best_val_loss": best_val_loss,
+            "epochs": log,
+        }, f, indent=2)
 
-    print(f"\nFine-tuning complete. Best val loss: {best_val_loss:.4f}")
+    print(f"\nDone. Best epoch {best_epoch}  val_loss={best_val_loss:.4f}")
+    print(f"Checkpoint → {out_dir}/student_best.pth")
+    print(f"Eval cmd:    python scripts/eval_zeroshot.py --checkpoint {out_dir}/student_best.pth")
 
 
 if __name__ == "__main__":
