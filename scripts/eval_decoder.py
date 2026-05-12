@@ -1,27 +1,32 @@
 """
-Zero-shot evaluation of the Phase 2 distilled student on 4 test datasets.
+Evaluate the class-agnostic decoder on 4 test datasets.
 
 Pipeline per image:
-  TIPS vision encoder (frozen) → patch tokens (B, 576, 1024)
+  TIPS vision encoder (frozen) → patch tokens (B, N, 1024)
   → reshape (B, 1024, 24, 24)
-  → SpatialAdapter (trained, from checkpoint)
+  → SpatialAdapter (frozen, from Phase 2 checkpoint)
   → L2-normalise
-  → einsum with K dataset class embeddings (encoded once)
-  → (B, K, 24, 24) → upsample to GT size → argmax
+  → einsum with K dataset class embeddings → (B, K, 24, 24)
+  → reshape (B*K, 1, 24, 24)
+  → ClassAgnosticDecoder → (B*K, 1, 96, 96)
+  → reshape (B, K, 96, 96)
+  → upsample to GT size → argmax → mIoU
 
-No decoder is used: zero-shot evaluation encodes each dataset's class names
-directly, so any vocabulary works without retraining.
+Loads:
+  TIPS + SpatialAdapter : output/distill/student_best.pth  (Phase 2 format)
+  ClassAgnosticDecoder  : output/decoder_retrain/decoder_best.pth
 
-Results saved to: results/zeroshot/
+Results saved to: results/decoder_agnostic/
   {dataset}.json   — per-class IoU + mIoU
-  summary.json     — one-line mIoU per dataset
+  summary.json     — one-line mIoU per dataset + comparison to baselines
 
 Usage:
-  python scripts/eval_zeroshot.py \\
-      --checkpoint output/distill/student_best.pth \\
-      --tips-dir   checkpoints/tipsv2-l14 \\
-      --data-root  gs_net/data/datasets \\
-      --results-dir results/zeroshot \\
+  python scripts/eval_decoder.py \\
+      --student-ckpt  output/distill/student_best.pth \\
+      --decoder-ckpt  output/decoder_retrain/decoder_best.pth \\
+      --tips-dir      checkpoints/tipsv2-l14 \\
+      --data-root     gs_net/data/datasets \\
+      --results-dir   results/decoder_agnostic \\
       [--device cuda] [--batch-size 4]
 """
 
@@ -43,6 +48,8 @@ import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
+from gs_distill.decoder_agnostic import ClassAgnosticDecoder
+
 
 # ── Dataset configs ───────────────────────────────────────────────────────────
 
@@ -56,7 +63,6 @@ DATASETS = {
                       "road-flooded","road-non-flooded","water","tree",
                       "vehicle","pool","grass"],
         "ignore_label": 0,
-        "json": "datasets/floodnet.json",
     },
     "FAST": {
         "img_dir":   "FAST/val/images",
@@ -73,7 +79,6 @@ DATASETS = {
                       "Tennis-Court","Tractor","Trailer","Truck-Tractor","Tugboat",
                       "Van","Warship"],
         "ignore_label": 255,
-        "json": "datasets/fast.json",
     },
     "Potsdam": {
         "img_dir":   "PotsdamSplit/img_dir/val",
@@ -82,7 +87,6 @@ DATASETS = {
         "mask_ext":  ".png",
         "classes":   ["impervious surface","building","low vegetation","tree","car"],
         "ignore_label": 5,
-        "json": "datasets/potsdam.json",
     },
     "FLAIR": {
         "img_dir":   "FLAIR_test/image",
@@ -93,7 +97,6 @@ DATASETS = {
                       "water","coniferous","deciduous","brushwood","vineyard",
                       "herbaceous vegetation","agricultural land","plowed land"],
         "ignore_label": 12,
-        "json": "datasets/flair.json",
     },
 }
 
@@ -118,7 +121,6 @@ class SpatialAdapter(nn.Module):
 
 
 def _load_tips(tips_dir: str):
-    """Load TIPSv2 from a local directory, bypassing AutoModel.from_pretrained."""
     tips_path = Path(tips_dir)
     pkg = "tips_local"
 
@@ -148,27 +150,21 @@ def _load_tips(tips_dir: str):
     _load_module("image_encoder")
     _load_module("text_encoder")
     tips_mod = _load_module("modeling_tips")
-
     config_mod = sys.modules[f"{pkg}.configuration_tips"]
     config = config_mod.TIPSv2Config.from_pretrained(tips_dir)
-    model = tips_mod.TIPSv2Model(config)
-    return model
+    return tips_mod.TIPSv2Model(config)
 
 
 # ── IoU computation ───────────────────────────────────────────────────────────
 
 def compute_miou(all_preds, all_gts, num_classes, ignore_label):
-    """
-    Compute per-class IoU and mIoU.
-    Only counts classes that actually appear in GT (union > 0).
-    """
     intersection = np.zeros(num_classes, dtype=np.float64)
     union        = np.zeros(num_classes, dtype=np.float64)
 
     for pred, gt in zip(all_preds, all_gts):
         gt   = gt.astype(np.int64)
         pred = pred.astype(np.int64)
-        valid = gt != ignore_label
+        valid  = gt != ignore_label
         pred_v = pred[valid]
         gt_v   = gt[valid]
         for c in range(num_classes):
@@ -212,16 +208,16 @@ def load_mask(path):
 # ── Main eval loop ────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def eval_dataset(name, cfg, tips, adapter, data_root, device, batch_size, resolution):
-    class_names = cfg["classes"]
+def eval_dataset(name, cfg, tips, adapter, decoder, data_root, device, batch_size, resolution):
+    class_names  = cfg["classes"]
     num_classes  = len(class_names)
     ignore_label = cfg["ignore_label"]
 
     print(f"\n{'─'*60}")
     print(f"Dataset: {name}  ({num_classes} classes, ignore={ignore_label})")
 
-    # Pre-compute text embeddings for this dataset's class names
-    text_out = tips.encode_text(class_names)           # (K, 1024)
+    # Pre-compute text embeddings for this dataset's K classes
+    text_out = tips.encode_text(class_names)                      # (K, 1024)
     text_emb = F.normalize(text_out.float(), dim=-1).to(device)  # (K, 1024)
 
     pairs = load_pairs(data_root, cfg)
@@ -239,27 +235,33 @@ def eval_dataset(name, cfg, tips, adapter, data_root, device, batch_size, resolu
             orig_sizes.append((oh, ow))
             masks.append(load_mask(mask_path))
 
-        imgs = torch.stack(images).to(device)   # (B, 3, 336, 336)
+        imgs = torch.stack(images).to(device)  # (B, 3, 336, 336)
+        B    = imgs.shape[0]
+        K    = num_classes
 
         # TIPS vision encoder
-        out       = tips.encode_image(imgs)
-        patches   = out.patch_tokens.float()     # (B, N, 1024)  N=576
-        B, N, D   = patches.shape
-        H = W = int(N ** 0.5)                    # 24
-        feats = patches.permute(0, 2, 1).reshape(B, D, H, W)  # (B, 1024, 24, 24)
+        out     = tips.encode_image(imgs)
+        patches = out.patch_tokens.float()                  # (B, N, 1024)
+        _, N, D = patches.shape
+        H = W   = int(N ** 0.5)                            # 24
+        feats   = patches.permute(0, 2, 1).reshape(B, D, H, W)  # (B, 1024, 24, 24)
 
-        # SpatialAdapter
-        feats = adapter(feats)                   # (B, 1024, 24, 24)
-        feats = F.normalize(feats, dim=1)        # L2 per channel
+        # SpatialAdapter + L2-normalise
+        feats = adapter(feats)
+        feats = F.normalize(feats, dim=1)                  # (B, 1024, 24, 24)
 
-        # Correlation with dataset class embeddings
-        corr = torch.einsum("b d h w, k d -> b k h w", feats, text_emb)  # (B, K, 24, 24)
+        # Correlation: (B, K, 24, 24)
+        corr = torch.einsum("b d h w, k d -> b k h w", feats, text_emb)
+
+        # Class-agnostic decoder: (B, K, 24, 24) → (B*K, 1, 24, 24) → (B*K, 1, 96, 96)
+        corr_flat = corr.reshape(B * K, 1, H, W)
+        out_flat  = decoder(corr_flat)                     # (B*K, 1, 96, 96)
+        logits    = out_flat.reshape(B, K, 96, 96)        # (B, K, 96, 96)
 
         for j, (oh, ow) in enumerate(orig_sizes):
-            # Upsample to original mask resolution
             logit = F.interpolate(
-                corr[j:j+1], size=(oh, ow), mode="bilinear", align_corners=False
-            )[0]                                  # (K, oh, ow)
+                logits[j:j+1], size=(oh, ow), mode="bilinear", align_corners=False
+            )[0]                                           # (K, oh, ow)
             pred = logit.argmax(dim=0).cpu().numpy().astype(np.uint8)
             all_preds.append(pred)
             all_gts.append(masks[j])
@@ -279,37 +281,36 @@ def eval_dataset(name, cfg, tips, adapter, data_root, device, batch_size, resolu
     print(f"mIoU: {result['miou']:.2f}%")
     for cls, iou in result["per_class_iou"].items():
         val = f"{iou:.2f}%" if iou is not None else "—"
-        print(f"  {cls:<30} {val}")
+        print(f"  {cls:<35} {val}")
 
     return result
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint",  default="output/distill/student_best.pth")
-    p.add_argument("--tips-dir",    default="checkpoints/tipsv2-l14")
-    p.add_argument("--data-root",   default="gs_net/data/datasets")
-    p.add_argument("--results-dir", default="results/zeroshot")
-    p.add_argument("--datasets",    nargs="+", default=list(DATASETS.keys()),
+    p.add_argument("--student-ckpt",  default="output/distill/student_best.pth")
+    p.add_argument("--decoder-ckpt",  default="output/decoder_retrain/decoder_best.pth")
+    p.add_argument("--tips-dir",      default="checkpoints/tipsv2-l14")
+    p.add_argument("--data-root",     default="gs_net/data/datasets")
+    p.add_argument("--results-dir",   default="results/decoder_agnostic")
+    p.add_argument("--datasets",      nargs="+", default=list(DATASETS.keys()),
                    help="Subset of datasets to evaluate")
-    p.add_argument("--batch-size",  type=int, default=4)
-    p.add_argument("--resolution",  type=int, default=336)
-    p.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--batch-size",    type=int, default=4)
+    p.add_argument("--resolution",    type=int, default=336)
+    p.add_argument("--device",        default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
     os.makedirs(args.results_dir, exist_ok=True)
     device = torch.device(args.device)
 
-    # ── Load checkpoint ───────────────────────────────────────────────────────
-    print(f"Loading checkpoint: {args.checkpoint}")
-    ckpt  = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    epoch = ckpt.get("epoch", "?")
-    print(f"  Epoch: {epoch}  val_loss: {ckpt.get('val_loss', '?'):.4f}")
+    # ── Load Phase 2 checkpoint (TIPS + SpatialAdapter) ──────────────────────
+    print(f"Loading Phase 2 student checkpoint: {args.student_ckpt}")
+    ckpt = torch.load(args.student_ckpt, map_location="cpu", weights_only=False)
+    print(f"  Epoch: {ckpt.get('epoch','?')}  val_loss: {ckpt.get('val_loss','?'):.4f}")
 
-    # Support both Phase 2 format (single "student" dict) and
-    # Phase 3 format (separate "tips", "adapter", "decoder" keys)
+    # Phase 2 format: single "student" dict with "tips.*" and "adapter.*" keys
     if "student" in ckpt:
-        sd       = ckpt["student"]
+        sd = ckpt["student"]
         tips_sd  = {k[len("tips."):]: v for k, v in sd.items() if k.startswith("tips.")}
         adapt_sd = {k[len("adapter."):]: v for k, v in sd.items() if k.startswith("adapter.")}
     else:
@@ -328,8 +329,23 @@ def main():
     adapter = SpatialAdapter(embed_dim=1024, bottleneck=256)
     adapter.load_state_dict(adapt_sd, strict=True)
     adapter.eval().to(device)
+    for param in adapter.parameters():
+        param.requires_grad = False
 
-    print(f"Models loaded on {device}.\n")
+    # ── Load ClassAgnosticDecoder ─────────────────────────────────────────────
+    print(f"Loading decoder checkpoint: {args.decoder_ckpt}")
+    dec_ckpt = torch.load(args.decoder_ckpt, map_location="cpu", weights_only=False)
+    dec_epoch = dec_ckpt.get("epoch", "?")
+    dec_loss  = dec_ckpt.get("val_loss", float("nan"))
+    print(f"  Decoder epoch: {dec_epoch}  val_loss: {dec_loss:.4f}")
+
+    decoder = ClassAgnosticDecoder()
+    decoder.load_state_dict(dec_ckpt["decoder"], strict=True)
+    decoder.eval().to(device)
+    for param in decoder.parameters():
+        param.requires_grad = False
+
+    print(f"All models loaded on {device}.\n")
 
     # ── Run evaluation ────────────────────────────────────────────────────────
     summary = {}
@@ -338,8 +354,10 @@ def main():
             print(f"Unknown dataset '{name}', skipping.")
             continue
         cfg = DATASETS[name]
-        result = eval_dataset(name, cfg, tips, adapter, args.data_root,
-                              device, args.batch_size, args.resolution)
+        result = eval_dataset(
+            name, cfg, tips, adapter, decoder,
+            args.data_root, device, args.batch_size, args.resolution
+        )
         summary[name] = result["miou"]
 
         out_path = Path(args.results_dir) / f"{name.lower()}.json"
@@ -348,31 +366,38 @@ def main():
         print(f"  Saved → {out_path}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
+    teacher = {"FloodNet": 48.40, "FAST": 18.53, "Potsdam": 44.11, "FLAIR": 28.18}
+    zeroshot = {"FloodNet": 4.27,  "FAST": 1.03,  "Potsdam": 13.27, "FLAIR": 4.65}
+
     summary_path = Path(args.results_dir) / "summary.json"
     summary_out  = {
-        "mode":       "zero-shot (Phase 2 only, no decoder)",
-        "checkpoint": args.checkpoint,
-        "epoch":      epoch,
-        "results":    summary,
-        "teacher_baseline": {
-            "FloodNet": 48.40, "FAST": 18.53, "Potsdam": 44.11, "FLAIR": 28.18,
+        "mode":            "class-agnostic decoder (distilled Phase 2 + retrained decoder)",
+        "student_ckpt":    args.student_ckpt,
+        "decoder_ckpt":    args.decoder_ckpt,
+        "decoder_epoch":   dec_epoch,
+        "results":         summary,
+        "baselines": {
+            "teacher":  teacher,
+            "zeroshot": zeroshot,
         },
     }
     with open(summary_path, "w") as f:
         json.dump(summary_out, f, indent=2)
 
-    print(f"\n{'='*60}")
-    print(f"ZERO-SHOT RESULTS (Phase 2 student, no fine-tuning)")
-    print(f"{'='*60}")
-    print(f"{'Dataset':<12} {'Student ZS':>12} {'Teacher':>10}")
-    print(f"{'─'*36}")
-    teacher = summary_out["teacher_baseline"]
+    print(f"\n{'='*65}")
+    print(f"DECODER EVAL RESULTS (class-agnostic, distilled Phase 2 student)")
+    print(f"{'='*65}")
+    print(f"{'Dataset':<12} {'With Decoder':>14} {'Zero-shot':>11} {'Teacher':>10}")
+    print(f"{'─'*50}")
     for ds, miou in summary.items():
-        t = teacher.get(ds, "—")
-        print(f"{ds:<12} {miou:>11.2f}%  {t:>9}%")
+        zs = zeroshot.get(ds, "—")
+        t  = teacher.get(ds, "—")
+        print(f"{ds:<12} {miou:>13.2f}%  {zs:>10}%  {t:>9}%")
     avg = sum(summary.values()) / len(summary) if summary else 0
-    print(f"{'─'*36}")
-    print(f"{'Average':<12} {avg:>11.2f}%")
+    avg_zs = sum(zeroshot[d] for d in summary if d in zeroshot) / len(summary)
+    avg_t  = sum(teacher[d]  for d in summary if d in teacher)  / len(summary)
+    print(f"{'─'*50}")
+    print(f"{'Average':<12} {avg:>13.2f}%  {avg_zs:>10.2f}%  {avg_t:>9.2f}%")
     print(f"\nFull results → {args.results_dir}/")
 
 
