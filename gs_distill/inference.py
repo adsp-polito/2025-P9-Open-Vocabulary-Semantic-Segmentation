@@ -51,47 +51,42 @@ def gs_distill_inference(
     """
     device = image.device
 
+    # ── 1. CLIP forward: base features + decoder skip connections ────────────
+    # CLIP is always frozen — extract under no_grad to avoid unnecessary graph.
     with torch.no_grad():
-        # ── 1. CLIP forward: base features + decoder skip connections ──────────
         clip_features, clip_skips = get_clip_skips(
             clip_model, image, list(clip_skip_layer_indices)
         )
-        # clip_features: (B, 577, 768)  (CLS + 576 patch tokens)
-        # clip_skips:    {layer_idx: (B, 768, 24, 24)}
-
         l0, l1 = clip_skip_layer_indices
-        res4_raw = clip_skips[l0]   # (B, 768, 24, 24)
-        res5_raw = clip_skips[l1]   # (B, 768, 24, 24)
+        res4_raw = clip_skips[l0]
+        res5_raw = clip_skips[l1]
+        res4 = clip_upsample1(res4_raw) if clip_upsample1 is not None else None
+        res5 = clip_upsample2(res5_raw) if clip_upsample2 is not None else None
 
-        # Project CLIP skip features for RIPD decoder guidance
-        # Matches how GSNet.py lines 312-313 produce res4/res5
-        res4 = clip_upsample1(res4_raw) if clip_upsample1 is not None else None  # (B,256,48,48)
-        res5 = clip_upsample2(res5_raw) if clip_upsample2 is not None else None  # (B,128,96,96)
+    # ── 2. Student conv head ─────────────────────────────────────────────────
+    # Runs under autograd so gradients flow to student heads during fine-tuning.
+    student_out = student(image)
+    fused_corr_embed  = student_out["fused_corr_embed"]   # (B, hidden_dim, T, 24, 24)
+    predicted_dino_L4 = student_out["dino_L4"]            # (B, 768, 48, 48)
+    predicted_dino_L8 = student_out["dino_L8"]            # (B, 768, 48, 48)
 
-        # ── 2. Student conv head ─────────────────────────────────────────────
-        student_out = student(image)
-        fused_corr_embed     = student_out["fused_corr_embed"]   # (B, hidden_dim, T, 24, 24)
-        predicted_dino_L4    = student_out["dino_L4"]            # (B, 768, 48, 48)
-        predicted_dino_L8    = student_out["dino_L8"]            # (B, 768, 48, 48)
+    # ── 3. Project predicted DINOv3 features for RIPD decoder guidance ───────
+    dino_L4_proj = dino_decod_proj1(predicted_dino_L4) if dino_decod_proj1 is not None else None
+    dino_L8_proj = dino_decod_proj2(predicted_dino_L8) if dino_decod_proj2 is not None else None
 
-        # ── 3. Project predicted DINOv3 features for RIPD decoder guidance ───
-        # Matches GSNet.py lines 300-301 (dino_decod_proj1 / dino_decod_proj2)
-        dino_L4_proj = dino_decod_proj1(predicted_dino_L4) if dino_decod_proj1 is not None else None
-        dino_L8_proj = dino_decod_proj2(predicted_dino_L8) if dino_decod_proj2 is not None else None
+    clip_guidance = {
+        "res3": rearrange(clip_features[:, 1:, :], "B (H W) C -> B C H W", H=24),
+        "res4": res4,
+        "res5": res5,
+    }
+    dino_guidance = [dino_L4_proj, dino_L8_proj]
 
-        clip_guidance = {
-            "res3": rearrange(clip_features[:, 1:, :], "B (H W) C -> B C H W", H=24),
-            "res4": res4,
-            "res5": res5,
-        }
-        dino_guidance = [dino_L4_proj, dino_L8_proj]
-
-        # ── 4. RIPD decoder (skip QGFF — feed pre-computed fused_corr_embed) ─
-        logit = ripd.forward_from_fusion(
-            fused_corr_embed=fused_corr_embed,
-            text_feats=text_feats,
-            appearance_guidance=clip_guidance,
-            dino_guidance=dino_guidance,
-        )
+    # ── 4. RIPD decoder (skip QGFF — feed pre-computed fused_corr_embed) ─────
+    logit = ripd.forward_from_fusion(
+        fused_corr_embed=fused_corr_embed,
+        text_feats=text_feats,
+        appearance_guidance=clip_guidance,
+        dino_guidance=dino_guidance,
+    )
 
     return logit

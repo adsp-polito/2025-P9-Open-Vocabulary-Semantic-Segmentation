@@ -46,6 +46,7 @@ import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 import clip as openai_clip
+import wandb
 
 from detectron2.config import get_cfg
 from detectron2.checkpoint import DetectionCheckpointer
@@ -129,11 +130,16 @@ def parse_args():
     p.add_argument("--batch-size",     type=int,   default=8)
     p.add_argument("--lr",             type=float, default=1e-5)
     p.add_argument("--weight-decay",   type=float, default=1e-4)
-    p.add_argument("--unfreeze-ripd",  action="store_true")
+    p.add_argument("--unfreeze-ripd",          action="store_true")
+    p.add_argument("--warmup-decoder-epochs",  type=int, default=0,
+                   help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
     p.add_argument("--amp",            action="store_true")
     p.add_argument("--num-workers",    type=int,   default=4)
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--val-fraction",   type=float, default=0.05)
+    p.add_argument("--wandb-project",  default="gs-distill")
+    p.add_argument("--wandb-run",      default=None, help="W&B run name (auto if omitted)")
+    p.add_argument("--no-wandb",       action="store_true", help="Disable W&B logging")
     return p.parse_args()
 
 
@@ -173,29 +179,34 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device)
 
-    # ── Load CLIP ────────────────────────────────────────────────────────────
-    print("Loading CLIP ...")
-    clip_model, _ = openai_clip.load("ViT-B/16", device=device, jit=False)
-    clip_model.eval()
-    for p in clip_model.parameters():
-        p.requires_grad = False
-
-    # ── Load GSNet (to extract RIPD + projection layers) ─────────────────────
+    # ── Load GSNet (to extract CLIP, RIPD + projection layers) ──────────────
     print("Loading GSNet ...")
     gsnet = build_gsnet(args.gsnet_config, args.gsnet_weights, str(device))
     gsnet = gsnet.to(device)
 
-    ripd            = gsnet.sem_seg_head.predictor
+    # Reuse the teacher's fine-tuned CLIP — correct architecture (ViT-L/14@336)
+    # and the attention tuning from GSNet pretraining.
+    clip_model = gsnet.sem_seg_head.predictor.clip_model
+    clip_model.eval()
+    for p in clip_model.parameters():
+        p.requires_grad = False
+
+    # Layer indices for CLIP skip extraction depend on architecture
+    # (ViT-B/16: [3,7], ViT-L/14@336: [7,15]) — read directly from the loaded model.
+    clip_skip_indices = tuple(gsnet.layer_indexes)
+
+    # forward_from_fusion lives on the RIPD transformer, not on the predictor wrapper.
+    ripd            = gsnet.sem_seg_head.predictor.transformer
     clip_upsample1  = gsnet.upsample1
     clip_upsample2  = gsnet.upsample2
     dino_decod_proj1 = gsnet.dino_decod_proj1
     dino_decod_proj2 = gsnet.dino_decod_proj2
 
-    if not args.unfreeze_ripd:
-        for p in ripd.parameters():
-            p.requires_grad = False
-    else:
-        print("  RIPD unfrozen for fine-tuning.")
+    warmup        = args.warmup_decoder_epochs
+    ripd_unfrozen = args.unfreeze_ripd or warmup > 0
+
+    for p in ripd.parameters():
+        p.requires_grad = ripd_unfrozen
 
     # ── Load student ─────────────────────────────────────────────────────────
     print(f"Loading student from {args.student_ckpt} ...")
@@ -209,6 +220,14 @@ def main():
         clip_layers=student_args.get("clip_layers", [4, 8, 10, 12]),
     ).to(device)
     student.load_state_dict(ckpt["student"])
+
+    if warmup > 0:
+        # Phase 1: student fully frozen while the decoder warms up alone.
+        for p in student.parameters():
+            p.requires_grad = False
+        print(f"  RIPD decoder unfrozen. Student heads frozen for {warmup}-epoch warmup.")
+    elif ripd_unfrozen:
+        print("  RIPD unfrozen for fine-tuning.")
 
     # ── Text features (frozen) ────────────────────────────────────────────────
     text_feats = build_text_features(args.class_json, clip_model, device)
@@ -229,20 +248,51 @@ def main():
     print(f"  Train: {n_train}  Val: {n_val}")
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
-    params = list(student.trainable_parameters())
-    if args.unfreeze_ripd:
-        params += list(ripd.parameters())
+    # shared_trunk + the three task heads; clip_embed_branch stays frozen
+    # (distillation-only auxiliary branch, not used in inference).
+    def _student_head_params():
+        return (
+            list(student.shared_trunk.parameters())
+            + list(student.fusion_branch.parameters())
+            + list(student.dino_l4_branch.parameters())
+            + list(student.dino_l8_branch.parameters())
+        )
 
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-    scaler    = GradScaler(enabled=args.amp)
+    if warmup > 0:
+        active_params = list(ripd.parameters())          # decoder-only warmup
+    else:
+        active_params = _student_head_params()
+        if ripd_unfrozen:
+            active_params += list(ripd.parameters())
+
+    optimizer  = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
+    scaler     = GradScaler(enabled=args.amp)
     ignore_idx = 255
 
     best_val_loss = float("inf")
 
+    # ── W&B ───────────────────────────────────────────────────────────────────
+    use_wandb = not args.no_wandb
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run,
+            config=vars(args),
+        )
+
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(args.epochs):
-        student.train()
-        if args.unfreeze_ripd:
+        # ── Warmup transition: unfreeze student heads after warmup epochs ─────
+        if warmup > 0 and epoch == warmup:
+            for p in _student_head_params():
+                p.requires_grad = True
+            active_params = _student_head_params() + list(ripd.parameters())
+            optimizer = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
+            print(f"  Epoch {epoch+1}: student heads unfrozen — joint fine-tuning begins.")
+
+        student_training = (warmup == 0) or (epoch >= warmup)
+        student.train() if student_training else student.eval()
+        if ripd_unfrozen:
             ripd.train()
 
         train_loss = 0.0
@@ -267,6 +317,7 @@ def main():
                     clip_upsample2=clip_upsample2,
                     dino_decod_proj1=dino_decod_proj1,
                     dino_decod_proj2=dino_decod_proj2,
+                    clip_skip_layer_indices=clip_skip_indices,
                 )
                 # logit: (B, T, H, W)  labels: (B, H, W)
                 logit_up = F.interpolate(logit, size=labels.shape[-2:],
@@ -276,12 +327,12 @@ def main():
             if args.amp:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(params, 1.0)
+                nn.utils.clip_grad_norm_(active_params, 1.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                nn.utils.clip_grad_norm_(params, 1.0)
+                nn.utils.clip_grad_norm_(active_params, 1.0)
                 optimizer.step()
 
             train_loss += loss.item()
@@ -289,7 +340,7 @@ def main():
 
         # Validation
         student.eval()
-        if args.unfreeze_ripd:
+        if ripd_unfrozen:
             ripd.eval()
         val_loss = 0.0
         n_val_batches = 0
@@ -305,6 +356,7 @@ def main():
                         clip_model=clip_model, ripd=ripd,
                         clip_upsample1=clip_upsample1, clip_upsample2=clip_upsample2,
                         dino_decod_proj1=dino_decod_proj1, dino_decod_proj2=dino_decod_proj2,
+                        clip_skip_layer_indices=clip_skip_indices,
                     )
                     logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                              mode="bilinear", align_corners=False)
@@ -314,12 +366,22 @@ def main():
 
         avg_train = train_loss / max(n_train_batches, 1)
         avg_val   = val_loss   / max(n_val_batches,   1)
-        print(f"Epoch {epoch+1:3d}/{args.epochs}  train={avg_train:.4f}  val={avg_val:.4f}")
+        phase     = "warmup" if (warmup > 0 and epoch < warmup) else "joint"
+        print(f"Epoch {epoch+1:3d}/{args.epochs}  [{phase}]  train={avg_train:.4f}  val={avg_val:.4f}")
+
+        if use_wandb:
+            wandb.log({
+                "epoch":       epoch + 1,
+                "train/loss":  avg_train,
+                "val/loss":    avg_val,
+                "phase":       phase,
+                "best_val_loss": best_val_loss,
+            }, step=epoch + 1)
 
         torch.save({
             "epoch": epoch,
             "student": student.state_dict(),
-            "ripd": ripd.state_dict() if args.unfreeze_ripd else None,
+            "ripd": ripd.state_dict() if ripd_unfrozen else None,
             "val_loss": avg_val,
         }, os.path.join(args.output_dir, "finetune_latest.pth"))
 
@@ -329,11 +391,13 @@ def main():
             torch.save({
                 "epoch": epoch,
                 "student": student.state_dict(),
-                "ripd": ripd.state_dict() if args.unfreeze_ripd else None,
+                "ripd": ripd.state_dict() if ripd_unfrozen else None,
                 "val_loss": avg_val,
             }, best_path)
             print(f"  ✓ New best val loss: {avg_val:.4f} → {best_path}")
 
+    if use_wandb:
+        wandb.finish()
     print(f"\nFine-tuning complete. Best val loss: {best_val_loss:.4f}")
 
 
