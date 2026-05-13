@@ -27,4 +27,7 @@ else
     echo ""
     echo "Monitor with:  squeue -u \$USER"
     echo "Cancel both:   scancel ${JOB1} ${JOB2}"
+    echo ""
+    echo "When Phase 2 finishes, run Phase 3 with:"
+    echo "  sh scripts/submit_finetune.sh --after ${JOB2}"
 fi
