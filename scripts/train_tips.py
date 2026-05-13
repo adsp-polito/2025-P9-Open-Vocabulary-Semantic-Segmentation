@@ -99,7 +99,7 @@ _TIPS_PREFIX_TOKENS = 2
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tips_native_res(tips_model) -> int:
-    return tips_model.config.image_size
+    return tips_model.config.img_size
 
 
 def extract_tips_layers(tips_model, image: torch.Tensor, layers: list) -> torch.Tensor:
@@ -136,6 +136,7 @@ def extract_tips_layers(tips_model, image: torch.Tensor, layers: list) -> torch.
         hooks.append(h)
 
     with torch.no_grad():
+        # Return value is (cls, register, patches) tuple — discarded here, hooks capture what we need
         tips_model.vision_encoder(image)
 
     for h in hooks:
@@ -145,11 +146,9 @@ def extract_tips_layers(tips_model, image: torch.Tensor, layers: list) -> torch.
     for l in layers:
         feat = captured[l]                          # (B, seq_len, C)
         feat = feat[:, _TIPS_PREFIX_TOKENS:, :]     # drop CLS + register → (B, n_patches, C)
-        # transpose to (n_patches, B, C) then reshape to (B, C, H, W)
-        feat = feat.permute(1, 0, 2)               # (n_patches, B, C)
-        n = feat.shape[0]
+        B, n, C = feat.shape
         H = W = int(n ** 0.5)
-        feat = rearrange(feat, "(H W) B C -> B C H W", H=H, W=W)
+        feat = rearrange(feat, "B (H W) C -> B C H W", H=H, W=W)
         feature_maps.append(feat)
 
     return torch.cat(feature_maps, dim=1)   # (B, len(layers)*C, H_grid, W_grid)
@@ -180,23 +179,21 @@ def get_tips_skips(tips_model, image: torch.Tensor, layer_indices: list):
         hooks.append(h)
 
     with torch.no_grad():
-        vit_out = tips_model.vision_encoder(image)
+        # vision_encoder returns (cls_token, register_tokens, patch_tokens) in non-training mode
+        _, _, patch_tokens = tips_model.vision_encoder(image)
 
     for h in hooks:
         h.remove()
 
-    # last_hidden_state from vision_encoder forward — use for res3 guidance
-    last_hidden = vit_out  # TIPSv2 vision_encoder returns the token sequence directly
-
     skips = {}
     for l in layer_indices:
-        feat = captured[l][:, _TIPS_PREFIX_TOKENS:, :]   # drop CLS + register
-        feat = feat.permute(1, 0, 2)                      # (n_patches, B, C)
-        n = feat.shape[0]
+        feat = captured[l][:, _TIPS_PREFIX_TOKENS:, :]   # drop CLS + register → (B, n_patches, C)
+        B, n, C = feat.shape
         H = W = int(n ** 0.5)
-        skips[l] = rearrange(feat, "(H W) B C -> B C H W", H=H, W=W)
+        skips[l] = rearrange(feat, "B (H W) C -> B C H W", H=H, W=W)
 
-    return last_hidden, skips
+    # patch_tokens: (B, 1024, C) — used directly for res3 guidance
+    return patch_tokens, skips
 
 
 def tips_normalise(images: torch.Tensor) -> torch.Tensor:
@@ -237,8 +234,8 @@ class TIPSStudent(nn.Module):
         self.d_dino       = d_dino
         self.num_classes  = num_classes
 
-        # hidden_size is top-level in TIPSv2 config (768 for B14)
-        clip_dim  = tips_model.config.hidden_size
+        # embed_dim is top-level in TIPSv2 config (768 for B14)
+        clip_dim  = tips_model.config.embed_dim
         trunk_in  = len(self.tips_layers) * clip_dim
 
         self.shared_trunk = nn.Sequential(
@@ -323,14 +320,9 @@ def tips_inference(
     dino_L4_proj = dino_decod_proj1(predicted_dino_L4) if dino_decod_proj1 is not None else None
     dino_L8_proj = dino_decod_proj2(predicted_dino_L8) if dino_decod_proj2 is not None else None
 
-    # res3: patch tokens from last hidden state, drop 2 prefix tokens (CLS + register)
-    # last_hidden shape depends on TIPSv2 vision_encoder return; handle both tensor and object
-    if hasattr(last_hidden, "last_hidden_state"):
-        patch_seq = last_hidden.last_hidden_state[:, _TIPS_PREFIX_TOKENS:, :]
-    else:
-        patch_seq = last_hidden[:, _TIPS_PREFIX_TOKENS:, :]   # (B, n_patches, C)
-
-    res3 = rearrange(patch_seq, "B (H W) C -> B C H W", H=32)   # 448/14 = 32
+    # res3: patch_tokens already extracted from vision_encoder output — (B, 1024, C)
+    # vision_encoder returns (cls_token, register_tokens, patch_tokens); get_tips_skips unpacks it
+    res3 = rearrange(last_hidden, "B (H W) C -> B C H W", H=32)   # 448/14=32 → 32×32 grid
 
     clip_guidance = {"res3": res3, "res4": res4, "res5": res5}
     dino_guidance = [dino_L4_proj, dino_L8_proj]
@@ -925,7 +917,7 @@ def main():
         p.requires_grad = False
 
     native_res = _tips_native_res(tips_model)
-    hidden_dim_check = tips_model.config.hidden_size
+    hidden_dim_check = tips_model.config.embed_dim
     print(f"  TIPSv2 native res={native_res}  hidden_dim={hidden_dim_check}"
           f"  layers={args.tips_layers}")
 

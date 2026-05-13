@@ -100,13 +100,12 @@ def extract_siglip_layers(siglip_model, image: torch.Tensor, layers: list) -> to
     """
     Extract intermediate patch features from a SigLIP ViT for specified encoder layer indices.
 
-    HuggingFace SigLIP hooks deliver output shape (B, seq_len, C); we transpose to
-    (seq_len, B, C) and drop the CLS token at position 0 to match the CLIP convention
-    used throughout the rest of this codebase.
+    SiglipEncoderLayer returns a plain tensor (B, seq_len, C) — no CLS token, no tuple.
+    All 576 tokens (24×24) are patch tokens for siglip-base-patch16-384.
 
     Args:
         siglip_model: frozen SiglipModel.
-        image: (B, 3, H, W) SigLIP-normalised, already at native resolution.
+        image: (B, 3, H, W) SigLIP-normalised, any spatial size.
         layers: list of encoder layer indices to hook, e.g. [4, 8, 10, 11].
 
     Returns:
@@ -122,10 +121,8 @@ def extract_siglip_layers(siglip_model, image: torch.Tensor, layers: list) -> to
     for l in layers:
         def make_hook(idx):
             def hook(module, input, output):
-                # HF SigLIP encoder layers return a tuple; first element is hidden state
-                hidden = output[0] if isinstance(output, tuple) else output
-                # (B, seq_len, C) → (seq_len, B, C)
-                captured[idx] = hidden.permute(1, 0, 2)
+                # SiglipEncoderLayer returns a plain tensor (B, seq_len, C)
+                captured[idx] = output
             return hook
         h = siglip_model.vision_model.encoder.layers[l].register_forward_hook(make_hook(l))
         hooks.append(h)
@@ -138,10 +135,10 @@ def extract_siglip_layers(siglip_model, image: torch.Tensor, layers: list) -> to
 
     feature_maps = []
     for l in layers:
-        feat = captured[l][1:, :, :]   # drop CLS at index 0  →  (seq_len-1, B, C)
-        n = feat.shape[0]
+        feat = captured[l]              # (B, seq_len, C) — all tokens are patches, no CLS
+        B, n, C = feat.shape
         H = W = int(n ** 0.5)
-        feat = rearrange(feat, "(H W) B C -> B C H W", H=H, W=W)
+        feat = rearrange(feat, "B (H W) C -> B C H W", H=H, W=W)
         feature_maps.append(feat)
 
     return torch.cat(feature_maps, dim=1)   # (B, len(layers)*C, H_grid, W_grid)
@@ -166,8 +163,8 @@ def get_siglip_skips(siglip_model, image: torch.Tensor, layer_indices: list):
     for l in layer_indices:
         def make_hook(idx):
             def hook(module, input, output):
-                hidden = output[0] if isinstance(output, tuple) else output
-                captured[idx] = hidden.permute(1, 0, 2)   # (seq_len, B, C)
+                # SiglipEncoderLayer returns a plain tensor (B, seq_len, C)
+                captured[idx] = output
             return hook
         h = siglip_model.vision_model.encoder.layers[l].register_forward_hook(make_hook(l))
         hooks.append(h)
@@ -178,18 +175,17 @@ def get_siglip_skips(siglip_model, image: torch.Tensor, layer_indices: list):
     for h in hooks:
         h.remove()
 
-    # CLS token from pooled output (mirrors clip_features used for res3 guidance)
-    # last_hidden_state: (B, seq_len, C); index 0 = CLS
-    cls_token = vit_out.last_hidden_state   # keep full sequence for res3 guidance
+    # last_hidden_state: (B, seq_len, C) — all patch tokens, no CLS
+    last_hidden_state = vit_out.last_hidden_state
 
     skips = {}
     for l in layer_indices:
-        feat = captured[l][1:, :, :]   # drop CLS
-        n = feat.shape[0]
+        feat = captured[l]   # (B, seq_len, C) — all tokens are patches
+        B, n, C = feat.shape
         H = W = int(n ** 0.5)
-        skips[l] = rearrange(feat, "(H W) B C -> B C H W", H=H, W=W)
+        skips[l] = rearrange(feat, "B (H W) C -> B C H W", H=H, W=W)
 
-    return cls_token, skips
+    return last_hidden_state, skips
 
 
 def siglip_normalise(images: torch.Tensor) -> torch.Tensor:
@@ -328,9 +324,9 @@ def siglip_inference(
     dino_L4_proj = dino_decod_proj1(predicted_dino_L4) if dino_decod_proj1 is not None else None
     dino_L8_proj = dino_decod_proj2(predicted_dino_L8) if dino_decod_proj2 is not None else None
 
-    # res3 skip: take all patch tokens from cls_token (last_hidden_state), drop CLS
-    # cls_token here is actually last_hidden_state (B, seq_len, C)
-    res3 = rearrange(cls_token[:, 1:, :], "B (H W) C -> B C H W", H=24)
+    # res3: all 576 patch tokens from last_hidden_state — SigLIP has no CLS token
+    # last_hidden_state: (B, 576, C) for siglip-base-patch16-384
+    res3 = rearrange(last_hidden_state, "B (H W) C -> B C H W", H=24)
 
     clip_guidance = {"res3": res3, "res4": res4, "res5": res5}
     dino_guidance = [dino_L4_proj, dino_L8_proj]
