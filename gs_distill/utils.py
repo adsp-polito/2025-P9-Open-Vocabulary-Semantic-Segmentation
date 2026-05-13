@@ -1,10 +1,5 @@
 """
 Utilities for CLIP multi-layer feature extraction used by the student model.
-
-CLIP ViT-B/16 produces patches at 24x24 spatial resolution (384/16=24).
-We hook into resblocks[i] for i in [4, 8, 10, 12] to get intermediate features.
-Each hook output has shape (seq_len, B, C) = (577, B, 768) in OpenAI CLIP's convention,
-where index 0 is CLS and 1: are the 576 patch tokens.
 """
 
 import torch
@@ -13,26 +8,42 @@ from einops import rearrange
 from typing import List
 
 
+def _clip_native_res(clip_model) -> int:
+    """
+    Infer CLIP's expected square input resolution from its positional embedding.
+    Works for any ViT variant (ViT-B/16@384 → 384, ViT-L/14@336 → 336, etc.).
+    """
+    n_pos = clip_model.visual.positional_embedding.shape[0] - 1  # subtract CLS token
+    h_grid = int(n_pos ** 0.5)
+    patch_size = clip_model.visual.conv1.kernel_size[0]
+    return h_grid * patch_size
+
+
 def extract_clip_layers(clip_model, image: torch.Tensor, layers: List[int]) -> torch.Tensor:
     """
-    Extract intermediate patch features from CLIP ViT-B/16 for specified transformer block indices.
+    Extract intermediate patch features from a CLIP ViT for specified transformer block indices.
+
+    Automatically resizes the input image to the CLIP model's native resolution so this
+    works for any ViT variant (ViT-B/16, ViT-L/14, etc.) regardless of input size.
 
     Args:
-        clip_model: OpenAI CLIP visual model (frozen).
-        image: (B, 3, H, W) pre-normalised input, resized to CLIP resolution before this call.
-        layers: list of block indices to hook, e.g. [4, 8, 10, 12].
+        clip_model: frozen OpenAI CLIP model.
+        image: (B, 3, H, W) pre-normalised input (any spatial size).
+        layers: list of resblock indices to hook, e.g. [4, 8, 10, 12].
 
     Returns:
-        (B, len(layers)*C, H_grid, W_grid) stacked spatial features,
-        where C=768, H_grid=W_grid=24 for ViT-B/16 @ 384px.
+        (B, len(layers)*C, H_grid, W_grid) stacked spatial features.
     """
-    captured = {}
+    native_res = _clip_native_res(clip_model)
+    if image.shape[-2] != native_res or image.shape[-1] != native_res:
+        image = F.interpolate(image, size=(native_res, native_res),
+                              mode="bilinear", align_corners=False)
 
+    captured = {}
     hooks = []
     for l in layers:
         def make_hook(idx):
             def hook(module, input, output):
-                # OpenAI CLIP resblocks return (seq_len, B, C)
                 captured[idx] = output
             return hook
         h = clip_model.visual.transformer.resblocks[l].register_forward_hook(make_hook(l))
@@ -46,22 +57,31 @@ def extract_clip_layers(clip_model, image: torch.Tensor, layers: List[int]) -> t
 
     feature_maps = []
     for l in layers:
-        feat = captured[l]          # (seq_len, B, C) = (577, B, 768)
-        feat = feat[1:, :, :]       # drop CLS → (576, B, 768)
-        feat = rearrange(feat, "(H W) B C -> B C H W", H=24, W=24)
+        feat = captured[l]           # (seq_len, B, C)
+        feat = feat[1:, :, :]        # drop CLS token
+        n = feat.shape[0]
+        H = W = int(n ** 0.5)
+        feat = rearrange(feat, "(H W) B C -> B C H W", H=H, W=W)
         feature_maps.append(feat)
 
-    return torch.cat(feature_maps, dim=1)   # (B, len(layers)*768, 24, 24)
+    return torch.cat(feature_maps, dim=1)   # (B, len(layers)*C, H_grid, W_grid)
 
 
 def get_clip_skips(clip_model, image: torch.Tensor, layer_indices: List[int]):
     """
-    Return raw (seq_len, B, C) outputs at given block indices, for RIPD skip connections.
-    Used at inference to pass res4/res5 to RIPD's decoder guidance projections.
+    Return patch feature maps at given resblock indices, for RIPD skip connections.
+
+    Automatically resizes the input image to the CLIP model's native resolution.
 
     Returns:
-        dict mapping layer_index -> (B, 768, 24, 24)
+        clip_features: dense image features from encode_image
+        skips: dict mapping layer_index -> (B, C, H_grid, W_grid)
     """
+    native_res = _clip_native_res(clip_model)
+    if image.shape[-2] != native_res or image.shape[-1] != native_res:
+        image = F.interpolate(image, size=(native_res, native_res),
+                              mode="bilinear", align_corners=False)
+
     captured = {}
     hooks = []
     for l in layer_indices:
@@ -80,7 +100,9 @@ def get_clip_skips(clip_model, image: torch.Tensor, layer_indices: List[int]):
 
     skips = {}
     for l in layer_indices:
-        feat = captured[l][1:, :, :]    # (576, B, 768)
-        skips[l] = rearrange(feat, "(H W) B C -> B C H W", H=24, W=24)
+        feat = captured[l][1:, :, :]   # drop CLS token
+        n = feat.shape[0]
+        H = W = int(n ** 0.5)
+        skips[l] = rearrange(feat, "(H W) B C -> B C H W", H=H, W=W)
 
     return clip_features, skips
