@@ -14,7 +14,7 @@ set -euo pipefail
 PROJECT_ROOT="/nfs/home/hassan/2025-P9-Open-Vocabulary-Semantic-Segmentation"
 PYTHON="/nfs/home/hassan/miniconda3/envs/gsnet/bin/python3"
 cd "${PROJECT_ROOT}"
-mkdir -p jobs-ashie/logs output/finetune/eval
+mkdir -p jobs-ashie/logs output/ashie/finetune/eval
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate gsnet
@@ -30,7 +30,7 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
 fi
 
 GSNET_WEIGHTS="output/gsnet_pretrain/model_final.pth"
-FINETUNE_CKPT="output/finetune/finetune_best.pth"
+FINETUNE_CKPT="output/ashie/finetune/finetune_best.pth"
 
 if [[ ! -f "${GSNET_WEIGHTS}" ]]; then
     echo "[ERROR] GSNet checkpoint not found: ${GSNET_WEIGHTS}"
@@ -50,7 +50,7 @@ echo "  GSNet:     ${GSNET_WEIGHTS}"
 echo "  Finetune:  ${FINETUNE_CKPT}"
 echo "  Images:    gs_net/data/datasets/LandDiscover_50K/TE_Image"
 echo "  Labels:    gs_net/data/datasets/LandDiscover_50K/TE_Label"
-echo "  Output:    output/finetune/eval"
+echo "  Output:    output/ashie/finetune/eval"
 echo "============================================================"
 echo "Job ID: ${SLURM_JOB_ID:-N/A}   Node: ${SLURM_NODELIST:-N/A}"
 echo "Start:  $(date)"
@@ -65,7 +65,7 @@ nvidia-smi
     --image-dir     gs_net/data/datasets/LandDiscover_50K/TE_Image \
     --label-dir     gs_net/data/datasets/LandDiscover_50K/TE_Label \
     --class-json    datasets/landdiscover.json \
-    --output-dir    output/finetune/eval \
+    --output-dir    output/ashie/finetune/eval \
     --batch-size    4 \
     --num-workers   4 \
     --amp
@@ -73,7 +73,7 @@ nvidia-smi
 echo ""
 echo "============================================================"
 echo "Phase 3 done."
-echo "  mIoU and per-class results: output/finetune/eval/report.txt"
-echo "  CSV:                        output/finetune/eval/per_class_iou.csv"
+echo "  mIoU and per-class results: output/ashie/finetune/eval/report.txt"
+echo "  CSV:                        output/ashie/finetune/eval/per_class_iou.csv"
 echo "End: $(date)"
 echo "============================================================"

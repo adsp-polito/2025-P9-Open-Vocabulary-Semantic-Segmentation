@@ -14,7 +14,7 @@ set -euo pipefail
 PROJECT_ROOT="/nfs/home/hassan/2025-P9-Open-Vocabulary-Semantic-Segmentation"
 PYTHON="/nfs/home/hassan/miniconda3/envs/gsnet/bin/python3"
 cd "${PROJECT_ROOT}"
-mkdir -p jobs-ashie/logs output/finetune
+mkdir -p jobs-ashie/logs output/ashie/finetune
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate gsnet
@@ -50,7 +50,7 @@ echo "  GSNet:    ${GSNET_WEIGHTS}"
 echo "  Student:  ${STUDENT_CKPT}"
 echo "  Images:   gs_net/data/datasets/LandDiscover_50K/TR_Image"
 echo "  Labels:   gs_net/data/datasets/LandDiscover_50K/TR_Label"
-echo "  Output:   output/finetune"
+echo "  Output:   output/ashie/finetune"
 echo "============================================================"
 echo "Job ID: ${SLURM_JOB_ID:-N/A}   Node: ${SLURM_NODELIST:-N/A}"
 echo "Start:  $(date)"
@@ -64,7 +64,7 @@ nvidia-smi
     --student-ckpt          "${STUDENT_CKPT}" \
     --image-dir             gs_net/data/datasets/LandDiscover_50K/TR_Image \
     --label-dir             gs_net/data/datasets/LandDiscover_50K/TR_Label \
-    --output-dir            output/finetune \
+    --output-dir            output/ashie/finetune \
     --epochs                15 \
     --batch-size            4 \
     --lr                    1e-5 \
@@ -76,6 +76,6 @@ nvidia-smi
 
 echo ""
 echo "============================================================"
-echo "Phase 3 done. Best checkpoint: output/finetune/finetune_best.pth"
+echo "Phase 3 done. Best checkpoint: output/ashie/finetune/finetune_best.pth"
 echo "End: $(date)"
 echo "============================================================"
