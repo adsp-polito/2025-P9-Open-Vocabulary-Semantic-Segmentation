@@ -6,13 +6,18 @@ Mixed loss:
   L_distill = temperature-scaled BCE vs cached teacher logits (40-class, 96x96)
   L_gt      = CrossEntropy vs LD50K GT masks (40-class, resized to 96x96)
 
-Unfreezes TIPS last N blocks (default 4) at a lower LR than adapter+decoder.
+Architecture:
+  TIPS vision encoder (last N blocks unfrozen) → patch tokens
+  → SpatialAdapter → L2-normalise
+  → SpatialProjector → spatial context (B, 64, 24, 24)
+  → einsum with text embeddings → correlation (B, K, 24, 24)
+  → tile + concat → (B*K, 65, 24, 24)
+  → ClassAgnosticDecoder → (B*K, 1, 96, 96) → (B, K, 96, 96)
 
-For the from-scratch ablation baseline, pass --no-distill-init: adapter and
-decoder are randomly initialised while TIPS still loads its pretrained weights.
+For the scratch ablation baseline, pass --no-distill-init: adapter starts from
+random weights while TIPS still loads its pretrained weights.
 
-Results saved under output-dir/distilled/ or output-dir/scratch/.
-Eval is run separately via eval_zeroshot.py with the Phase 3 checkpoint.
+Projector and decoder always start from random init in both runs.
 
 Usage:
     python scripts/train_finetune.py \\
@@ -22,8 +27,8 @@ Usage:
         --gt-dir      gs_net/data/datasets/LandDiscover_50K/GT_ID \\
         --cache-dir   cache_logits/ \\
         --output-dir  output/finetune \\
-        [--no-distill-init]
-        [--epochs 10] [--batch-size 8] [--lr 1e-4] [--backbone-lr 1e-5] [--amp]
+        [--no-distill-init] \\
+        [--epochs 25] [--batch-size 8] [--lr 1e-4] [--backbone-lr 1e-5] [--amp]
 """
 
 import sys, os
@@ -36,6 +41,7 @@ import importlib.machinery
 import importlib.util
 import json
 import math
+import random
 import time
 from pathlib import Path
 
@@ -48,8 +54,10 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
+from gs_distill.decoder_agnostic import ClassAgnosticDecoder, SpatialProjector
 
-# ── Model components ──────────────────────────────────────────────────────────
+
+# ── SpatialAdapter (inline — same architecture as Phase 2) ────────────────────
 
 class SpatialAdapter(nn.Module):
     def __init__(self, embed_dim=1024, bottleneck=256):
@@ -68,29 +76,7 @@ class SpatialAdapter(nn.Module):
         return x + self.net(x)
 
 
-class LightweightDecoder(nn.Module):
-    def __init__(self, num_classes=40, hidden=128):
-        super().__init__()
-        half, quarter = hidden // 2, hidden // 4
-        self.net = nn.Sequential(
-            nn.Conv2d(num_classes, hidden, 3, padding=1),
-            nn.GroupNorm(8, hidden),
-            nn.GELU(),
-            nn.ConvTranspose2d(hidden, half, 2, stride=2),
-            nn.GroupNorm(8, half),
-            nn.GELU(),
-            nn.Conv2d(half, half, 3, padding=1),
-            nn.GroupNorm(8, half),
-            nn.GELU(),
-            nn.ConvTranspose2d(half, quarter, 2, stride=2),
-            nn.GroupNorm(4, quarter),
-            nn.GELU(),
-            nn.Conv2d(quarter, num_classes, 3, padding=1),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
+# ── TIPS loader ───────────────────────────────────────────────────────────────
 
 def _load_tips(tips_dir: str):
     tips_path = Path(tips_dir)
@@ -134,12 +120,17 @@ class LD50KFinetuneDataset(Dataset):
       image:           (3, 336, 336) float32 in [0, 1]
       gt_mask_96:      (96, 96)      int64   class labels 0-39
       teacher_logits:  (40, 96, 96)  float32
+
+    Augmentation (train=True): random horizontal and vertical flips applied
+    consistently to all three tensors.
     """
     EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
-    def __init__(self, image_dir, gt_dir, cache_dir, resolution=336, gt_size=96):
+    def __init__(self, image_dir, gt_dir, cache_dir,
+                 resolution=336, gt_size=96, augment=False):
         self.resolution = resolution
         self.gt_size    = gt_size
+        self.augment    = augment
 
         img_map   = {p.stem: p for p in Path(image_dir).iterdir()
                      if p.suffix.lower() in self.EXTENSIONS}
@@ -164,14 +155,26 @@ class LD50KFinetuneDataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         img = img.resize((self.resolution, self.resolution), Image.BILINEAR)
         image = torch.from_numpy(np.array(img)).float() / 255.0
-        image = image.permute(2, 0, 1)
+        image = image.permute(2, 0, 1)  # (3, H, W)
 
         gt = Image.open(gt_path).convert("L")
         gt = gt.resize((self.gt_size, self.gt_size), Image.NEAREST)
-        gt_mask = torch.from_numpy(np.array(gt)).long()
+        gt_mask = torch.from_numpy(np.array(gt)).long()  # (96, 96)
 
         cache = torch.load(cache_path, map_location="cpu", weights_only=True)
-        teacher_logits = cache["logits"].float()
+        teacher_logits = cache["logits"].float()  # (40, 96, 96)
+
+        if self.augment:
+            # Random horizontal flip — applied consistently to all spatial tensors
+            if random.random() < 0.5:
+                image          = torch.flip(image, dims=[-1])
+                gt_mask        = torch.flip(gt_mask.unsqueeze(0), dims=[-1]).squeeze(0)
+                teacher_logits = torch.flip(teacher_logits, dims=[-1])
+            # Random vertical flip
+            if random.random() < 0.5:
+                image          = torch.flip(image, dims=[-2])
+                gt_mask        = torch.flip(gt_mask.unsqueeze(0), dims=[-2]).squeeze(0)
+                teacher_logits = torch.flip(teacher_logits, dims=[-2])
 
         return image, gt_mask, teacher_logits
 
@@ -196,14 +199,16 @@ def cosine_lr(optimizer, epoch, total_epochs, base_lrs, min_lr=1e-7):
 
 # ── Epoch runner ──────────────────────────────────────────────────────────────
 
-def run_epoch(tips, adapter, decoder, text_emb, loader,
+def run_epoch(tips, adapter, projector, decoder, text_emb, loader,
               optimizer, scaler, device, amp, tau, lam, train=True):
     tips.train(train)
     adapter.train(train)
+    projector.train(train)
     decoder.train(train)
     ctx = torch.enable_grad() if train else torch.no_grad()
 
     total, d_sum, g_sum, n = 0.0, 0.0, 0.0, 0
+
     with ctx:
         for images, gt_masks, teacher_logits in tqdm(
             loader, desc="train" if train else "val ", leave=False
@@ -216,30 +221,66 @@ def run_epoch(tips, adapter, decoder, text_emb, loader,
                 optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=amp):
+                # TIPS encoder
                 out     = tips.encode_image(images)
-                patches = out.patch_tokens.float()
+                patches = out.patch_tokens.float()         # (B, N, 1024)
                 B, N, D = patches.shape
-                H = W   = int(N ** 0.5)
+                H = W   = int(N ** 0.5)                    # 24
                 feats   = patches.permute(0, 2, 1).reshape(B, D, H, W)
-                feats   = adapter(feats)
-                feats   = F.normalize(feats, dim=1)
-                corr    = torch.einsum("b d h w, t d -> b t h w", feats, text_emb)
-                logits  = decoder(corr)
-                loss, ld, lg = mixed_loss(logits, teacher_logits, gt_masks, tau, lam)
+
+                # SpatialAdapter + L2-normalise
+                feats = adapter(feats)                     # (B, 1024, 24, 24)
+                feats = F.normalize(feats, dim=1)
+
+                # Spatial context branch
+                spatial_ctx = projector(feats)             # (B, 64, 24, 24)
+
+                # Correlation branch
+                K    = text_emb.shape[0]
+                corr = torch.einsum(
+                    "b d h w, t d -> b t h w", feats, text_emb
+                )                                          # (B, K, 24, 24)
+
+                # Tile spatial context and concatenate with correlation maps
+                spatial_tiled = (
+                    spatial_ctx.unsqueeze(1)
+                    .expand(-1, K, -1, -1, -1)
+                    .reshape(B * K, 64, H, W)
+                )                                          # (B*K, 64, 24, 24)
+                corr_flat = corr.reshape(B * K, 1, H, W)  # (B*K, 1,  24, 24)
+                dec_input = torch.cat(
+                    [corr_flat, spatial_tiled], dim=1
+                )                                          # (B*K, 65, 24, 24)
+
+                # ClassAgnosticDecoder
+                out_flat = decoder(dec_input)              # (B*K, 1,  96, 96)
+                logits   = out_flat.reshape(B, K, 96, 96) # (B,   K,  96, 96)
+
+                loss, ld, lg = mixed_loss(
+                    logits, teacher_logits, gt_masks, tau, lam
+                )
 
             if train:
                 if amp:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     nn.utils.clip_grad_norm_(
-                        list(adapter.parameters()) + list(decoder.parameters()), 1.0
+                        list(tips.parameters()) +
+                        list(adapter.parameters()) +
+                        list(projector.parameters()) +
+                        list(decoder.parameters()),
+                        1.0,
                     )
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
                     nn.utils.clip_grad_norm_(
-                        list(adapter.parameters()) + list(decoder.parameters()), 1.0
+                        list(tips.parameters()) +
+                        list(adapter.parameters()) +
+                        list(projector.parameters()) +
+                        list(decoder.parameters()),
+                        1.0,
                     )
                     optimizer.step()
 
@@ -251,7 +292,7 @@ def run_epoch(tips, adapter, decoder, text_emb, loader,
     return total / max(n, 1), d_sum / max(n, 1), g_sum / max(n, 1)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Args ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -262,14 +303,17 @@ def parse_args():
     p.add_argument("--cache-dir",       required=True)
     p.add_argument("--output-dir",      default="output/finetune")
     p.add_argument("--no-distill-init", action="store_true",
-                   help="Random adapter+decoder init (scratch ablation)")
-    p.add_argument("--epochs",          type=int,   default=10)
+                   help="Random adapter init — scratch ablation baseline")
+    p.add_argument("--epochs",          type=int,   default=25)
     p.add_argument("--batch-size",      type=int,   default=8)
-    p.add_argument("--lr",              type=float, default=1e-4)
-    p.add_argument("--backbone-lr",     type=float, default=1e-5)
+    p.add_argument("--lr",              type=float, default=1e-4,
+                   help="LR for adapter, projector, decoder")
+    p.add_argument("--backbone-lr",     type=float, default=1e-5,
+                   help="LR for unfrozen TIPS blocks")
     p.add_argument("--unfreeze-blocks", type=int,   default=4)
     p.add_argument("--tau",             type=float, default=4.0)
-    p.add_argument("--lam",             type=float, default=0.5)
+    p.add_argument("--lam",             type=float, default=0.5,
+                   help="Weight for distillation loss (1-lam for GT CE)")
     p.add_argument("--weight-decay",    type=float, default=1e-4)
     p.add_argument("--val-fraction",    type=float, default=0.05)
     p.add_argument("--num-workers",     type=int,   default=6)
@@ -279,6 +323,8 @@ def parse_args():
     p.add_argument("--device",          default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     args    = parse_args()
@@ -290,11 +336,14 @@ def main():
     print(f"Phase 3 fine-tuning — init: {tag.upper()}")
     print(f"Output: {out_dir}\n")
 
+    # ── Load Phase 2 checkpoint ───────────────────────────────────────────────
+    print(f"Loading Phase 2 checkpoint: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    sd   = ckpt["student"]
+
     # ── Load TIPS ─────────────────────────────────────────────────────────────
     print(f"Loading TIPS from {args.tips_dir} ...")
-    ckpt   = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    sd     = ckpt["student"]
-    tips   = _load_tips(args.tips_dir)
+    tips    = _load_tips(args.tips_dir)
     tips_sd = {k[len("tips."):]: v for k, v in sd.items() if k.startswith("tips.")}
     tips.load_state_dict(tips_sd, strict=True)
     tips.to(device)
@@ -310,58 +359,81 @@ def main():
     n_backbone = sum(p.numel() for p in tips.parameters() if p.requires_grad)
     print(f"  TIPS last {args.unfreeze_blocks} blocks unfrozen: {n_backbone/1e6:.1f}M params")
 
-    # ── Adapter & Decoder ─────────────────────────────────────────────────────
+    # ── Adapter ───────────────────────────────────────────────────────────────
     adapter = SpatialAdapter(embed_dim=1024, bottleneck=256).to(device)
-    decoder = LightweightDecoder(num_classes=args.num_classes, hidden=128).to(device)
 
     if not args.no_distill_init:
         adapter.load_state_dict(
             {k[len("adapter."):]: v for k, v in sd.items() if k.startswith("adapter.")},
-            strict=True
+            strict=True,
         )
-        decoder.load_state_dict(
-            {k[len("decoder."):]: v for k, v in sd.items() if k.startswith("decoder.")},
-            strict=True
-        )
-        print("  Adapter + Decoder: loaded from checkpoint")
+        print("  Adapter: loaded from Phase 2 checkpoint (distilled init)")
     else:
-        print("  Adapter + Decoder: randomly initialised (scratch baseline)")
+        print("  Adapter: randomly initialised (scratch baseline)")
 
-    # ── Text embeddings (40 LD50K classes, pre-computed once) ─────────────────
+    # ── Projector + Decoder (always random init) ──────────────────────────────
+    projector = SpatialProjector(in_dim=1024, out_dim=64).to(device)
+    decoder   = ClassAgnosticDecoder(in_channels=65).to(device)
+    print("  SpatialProjector + ClassAgnosticDecoder: randomly initialised")
+
+    # ── Text embeddings ───────────────────────────────────────────────────────
     ld50k_classes = json.load(open("datasets/landdiscover.json"))
     with torch.no_grad():
         text_emb = tips.encode_text(ld50k_classes)
         text_emb = F.normalize(text_emb.float(), dim=-1).to(device)
-    print(f"  Text embeddings pre-computed: {text_emb.shape}")
+    print(f"  Text embeddings: {text_emb.shape}")
 
-    n_head      = sum(p.numel() for p in adapter.parameters()) + \
-                  sum(p.numel() for p in decoder.parameters())
+    n_head = (sum(p.numel() for p in adapter.parameters()) +
+              sum(p.numel() for p in projector.parameters()) +
+              sum(p.numel() for p in decoder.parameters()))
     print(f"  Total trainable: {(n_backbone + n_head)/1e6:.2f}M params\n")
 
     # ── Data ──────────────────────────────────────────────────────────────────
     print("Building dataset ...")
     full_ds = LD50KFinetuneDataset(
-        args.image_dir, args.gt_dir, args.cache_dir, args.resolution
+        args.image_dir, args.gt_dir, args.cache_dir,
+        resolution=args.resolution, augment=True,
     )
     n_val   = max(1, int(len(full_ds) * args.val_fraction))
     n_train = len(full_ds) - n_val
-    train_ds, val_ds = random_split(
-        full_ds, [n_train, n_val], generator=torch.Generator().manual_seed(42)
+
+    # Validation split does not use augmentation
+    train_indices, val_indices = torch.utils.data.random_split(
+        range(len(full_ds)), [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
     )
+    train_ds = torch.utils.data.Subset(full_ds, train_indices.indices)
+
+    # Val dataset without augmentation
+    val_ds_raw = LD50KFinetuneDataset(
+        args.image_dir, args.gt_dir, args.cache_dir,
+        resolution=args.resolution, augment=False,
+    )
+    val_ds = torch.utils.data.Subset(val_ds_raw, val_indices.indices)
+
     print(f"  Train: {n_train}  Val: {n_val}")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+    )
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
-    optimizer = torch.optim.AdamW([
-        {"params": [p for p in tips.parameters() if p.requires_grad],
-         "lr": args.backbone_lr},
-        {"params": list(adapter.parameters()) + list(decoder.parameters()),
-         "lr": args.lr},
-    ], weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [p for p in tips.parameters() if p.requires_grad],
+             "lr": args.backbone_lr},
+            {"params": (list(adapter.parameters()) +
+                        list(projector.parameters()) +
+                        list(decoder.parameters())),
+             "lr": args.lr},
+        ],
+        weight_decay=args.weight_decay,
+    )
     base_lrs = [args.backbone_lr, args.lr]
     scaler   = GradScaler(enabled=args.amp)
 
@@ -376,25 +448,27 @@ def main():
 
         t0 = time.time()
         tr_loss, tr_d, tr_g = run_epoch(
-            tips, adapter, decoder, text_emb,
+            tips, adapter, projector, decoder, text_emb,
             train_loader, optimizer, scaler, device, args.amp,
-            args.tau, args.lam, train=True
+            args.tau, args.lam, train=True,
         )
         vl_loss, vl_d, vl_g = run_epoch(
-            tips, adapter, decoder, text_emb,
+            tips, adapter, projector, decoder, text_emb,
             val_loader, optimizer, scaler, device, args.amp,
-            args.tau, args.lam, train=False
+            args.tau, args.lam, train=False,
         )
         elapsed = time.time() - t0
         is_best = vl_loss < best_val_loss
 
         ckpt_data = {
-            "epoch": epoch, "tag": tag,
-            "tips": tips.state_dict(),
-            "adapter": adapter.state_dict(),
-            "decoder": decoder.state_dict(),
-            "val_loss": vl_loss,
-            "args": vars(args),
+            "epoch":     epoch,
+            "tag":       tag,
+            "tips":      tips.state_dict(),
+            "adapter":   adapter.state_dict(),
+            "projector": projector.state_dict(),
+            "decoder":   decoder.state_dict(),
+            "val_loss":  vl_loss,
+            "args":      vars(args),
         }
         if is_best:
             best_val_loss = vl_loss
@@ -403,13 +477,17 @@ def main():
         torch.save(ckpt_data, out_dir / "student_latest.pth")
 
         entry = {
-            "epoch": epoch,
-            "backbone_lr": lrs[0], "head_lr": lrs[1],
-            "train_loss": round(tr_loss, 6),
-            "train_distill": round(tr_d, 6), "train_gt": round(tr_g, 6),
-            "val_loss": round(vl_loss, 6),
-            "val_distill": round(vl_d, 6), "val_gt": round(vl_g, 6),
-            "is_best": is_best, "epoch_time_s": round(elapsed, 1),
+            "epoch":        epoch,
+            "backbone_lr":  lrs[0],
+            "head_lr":      lrs[1],
+            "train_loss":   round(tr_loss, 6),
+            "train_distill":round(tr_d,    6),
+            "train_gt":     round(tr_g,    6),
+            "val_loss":     round(vl_loss, 6),
+            "val_distill":  round(vl_d,    6),
+            "val_gt":       round(vl_g,    6),
+            "is_best":      is_best,
+            "epoch_time_s": round(elapsed, 1),
         }
         log.append(entry)
         print(
@@ -421,16 +499,24 @@ def main():
         )
 
     # ── Save log ──────────────────────────────────────────────────────────────
-    with open(out_dir / "training_log.json", "w") as f:
-        json.dump({
-            "run_settings": vars(args), "tag": tag,
-            "best_epoch": best_epoch, "best_val_loss": best_val_loss,
-            "epochs": log,
-        }, f, indent=2)
+    log_path = out_dir / "training_log.json"
+    with open(log_path, "w") as f:
+        json.dump(
+            {
+                "run_settings": vars(args),
+                "tag":          tag,
+                "best_epoch":   best_epoch,
+                "best_val_loss":best_val_loss,
+                "epochs":       log,
+            },
+            f, indent=2,
+        )
 
     print(f"\nDone. Best epoch {best_epoch}  val_loss={best_val_loss:.4f}")
     print(f"Checkpoint → {out_dir}/student_best.pth")
-    print(f"Eval cmd:    python scripts/eval_zeroshot.py --checkpoint {out_dir}/student_best.pth")
+    print(f"Log        → {log_path}")
+    print(f"Eval cmd:  python scripts/eval_decoder.py "
+          f"--checkpoint {out_dir}/student_best.pth")
 
 
 if __name__ == "__main__":
