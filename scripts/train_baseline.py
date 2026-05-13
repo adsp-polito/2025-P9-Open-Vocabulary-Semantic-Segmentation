@@ -158,7 +158,7 @@ def build_gsnet(config_file, weights_file, device):
 def build_text_features(class_json, clip_model, device):
     with open(class_json) as f:
         class_names = json.load(f)
-    templates = ["A photo of a {} in the scene"]
+    templates = ["a photo of a {}."]
     all_feats = []
     with torch.no_grad():
         for name in class_names:

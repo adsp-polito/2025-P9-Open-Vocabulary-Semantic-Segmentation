@@ -776,6 +776,7 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
             "dino_decod_proj1": dino_decod_proj1.state_dict() if dino_decod_proj1 is not None else None,
             "dino_decod_proj2": dino_decod_proj2.state_dict() if dino_decod_proj2 is not None else None,
             "val_loss": avg_val,
+            "args": vars(args),
         }, path)
 
     for epoch in range(args.finetune_epochs):
