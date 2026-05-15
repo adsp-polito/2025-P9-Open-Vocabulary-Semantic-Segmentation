@@ -136,6 +136,9 @@ def parse_args():
     p.add_argument("--num-workers",    type=int,   default=4)
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--val-fraction",   type=float, default=0.05)
+    p.add_argument("--data-fraction",  type=float, default=1.0,
+                   help="Fraction of dataset to use (e.g. 0.5 = 50%%). Fixed-seed random subset.")
+    p.add_argument("--data-seed",      type=int,   default=42)
     p.add_argument("--wandb-project",  default="gs-distill")
     p.add_argument("--wandb-run",      default=None, help="W&B run name (auto if omitted)")
     p.add_argument("--no-wandb",       action="store_true", help="Disable W&B logging")
@@ -171,6 +174,38 @@ def build_text_features(class_json, clip_model, device):
     # (T, P, C) → (1, T, P, C) batch dim
     text_feats = torch.stack(all_feats, dim=0).unsqueeze(0)
     return text_feats   # (1, T, P, C)
+
+
+def create_subset(dataset, fraction, seed):
+    from torch.utils.data import Subset
+    from collections import defaultdict
+
+    rng = np.random.RandomState(seed)
+
+    # Determine dominant class per image (mode of valid pixels, ignoring 255)
+    print(f"Building stratification index for {len(dataset)} images ...")
+    strata = []
+    for _, lbl_path in dataset.samples:
+        lbl = np.array(Image.open(lbl_path))
+        valid = lbl[lbl != 255]
+        dominant = int(np.bincount(valid).argmax()) if len(valid) > 0 else -1
+        strata.append(dominant)
+
+    # Sample proportionally from each stratum
+    stratum_buckets = defaultdict(list)
+    for idx, s in enumerate(strata):
+        stratum_buckets[s].append(idx)
+
+    selected = []
+    for s, idxs in sorted(stratum_buckets.items()):
+        n = max(1, round(len(idxs) * fraction))
+        chosen = rng.choice(idxs, min(n, len(idxs)), replace=False)
+        selected.extend(chosen.tolist())
+
+    rng.shuffle(selected)
+    print(f"Dataset subset (stratified): {len(selected)} / {len(dataset)} images ({fraction*100:.0f}%)")
+    print(f"  Strata covered: {len(stratum_buckets)} classes")
+    return Subset(dataset, selected)
 
 
 def main():
@@ -245,6 +280,8 @@ def main():
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     full_ds = SegDataset(args.image_dir, args.label_dir)
+    if args.data_fraction < 1.0:
+        full_ds = create_subset(full_ds, args.data_fraction, args.data_seed)
     n_val   = max(1, int(len(full_ds) * args.val_fraction))
     n_train = len(full_ds) - n_val
     gen = torch.Generator().manual_seed(42)

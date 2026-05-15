@@ -68,6 +68,7 @@ nvidia-smi
     --epochs                15 \
     --batch-size            1 \
     --grad-accum            2 \
+    --data-fraction         0.5 \
     --lr                    1e-5 \
     --warmup-decoder-epochs 3 \
     --num-workers           2 \
