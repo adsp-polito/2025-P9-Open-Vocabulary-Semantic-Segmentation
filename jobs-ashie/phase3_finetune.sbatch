@@ -66,7 +66,7 @@ nvidia-smi
     --label-dir             gs_net/data/datasets/LandDiscover_50K/GT_ID \
     --output-dir            output/ashie/finetune \
     --epochs                15 \
-    --batch-size            4 \
+    --batch-size            2 \
     --lr                    1e-5 \
     --warmup-decoder-epochs 3 \
     --num-workers           4 \
