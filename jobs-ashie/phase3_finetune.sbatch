@@ -49,7 +49,7 @@ echo "Phase 3 — GS-Distill fine-tuning on LD50K (ViT-L/14@336px)"
 echo "  GSNet:    ${GSNET_WEIGHTS}"
 echo "  Student:  ${STUDENT_CKPT}"
 echo "  Images:   gs_net/data/datasets/LandDiscover_50K/TR_Image"
-echo "  Labels:   gs_net/data/datasets/LandDiscover_50K/TR_Label"
+echo "  Labels:   gs_net/data/datasets/LandDiscover_50K/GT_ID"
 echo "  Output:   output/ashie/finetune"
 echo "============================================================"
 echo "Job ID: ${SLURM_JOB_ID:-N/A}   Node: ${SLURM_NODELIST:-N/A}"
@@ -63,7 +63,7 @@ nvidia-smi
     --gsnet-weights         "${GSNET_WEIGHTS}" \
     --student-ckpt          "${STUDENT_CKPT}" \
     --image-dir             gs_net/data/datasets/LandDiscover_50K/TR_Image \
-    --label-dir             gs_net/data/datasets/LandDiscover_50K/TR_Label \
+    --label-dir             gs_net/data/datasets/LandDiscover_50K/GT_ID \
     --output-dir            output/ashie/finetune \
     --epochs                15 \
     --batch-size            4 \
