@@ -69,7 +69,7 @@ nvidia-smi
     --batch-size            2 \
     --lr                    1e-5 \
     --warmup-decoder-epochs 3 \
-    --num-workers           4 \
+    --num-workers           2 \
     --amp \
     --wandb-project         gs-distill \
     --wandb-run             finetune-vitl336-run1
