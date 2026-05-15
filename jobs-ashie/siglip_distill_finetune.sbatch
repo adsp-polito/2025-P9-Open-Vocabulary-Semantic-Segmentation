@@ -42,7 +42,7 @@ echo "SigLIP — Phase 2 (distill) + Phase 3 (finetune) on LD50K"
 echo "  Backbone:  google/siglip-base-patch16-384"
 echo "  GSNet:     ${GSNET_WEIGHTS}"
 echo "  Images:    gs_net/data/datasets/LandDiscover_50K/TR_Image"
-echo "  Labels:    gs_net/data/datasets/LandDiscover_50K/TR_Label"
+echo "  Labels:    gs_net/data/datasets/LandDiscover_50K/GT_ID"
 echo "  Output:    output/ashie/siglip"
 echo "============================================================"
 echo "Job ID: ${SLURM_JOB_ID:-N/A}   Node: ${SLURM_NODELIST:-N/A}"
@@ -55,13 +55,14 @@ nvidia-smi
     --gsnet-config          configs/vitl_336_dinov3.yaml \
     --gsnet-weights         "${GSNET_WEIGHTS}" \
     --image-dir             gs_net/data/datasets/LandDiscover_50K/TR_Image \
-    --label-dir             gs_net/data/datasets/LandDiscover_50K/TR_Label \
+    --label-dir             gs_net/data/datasets/LandDiscover_50K/GT_ID \
     --output-dir            output/ashie/siglip \
     --distill-epochs        30 \
     --finetune-epochs       15 \
-    --batch-size            4 \
+    --batch-size            1 \
+    --grad-accum            2 \
     --lr                    1e-5 \
-    --num-workers           4 \
+    --num-workers           2 \
     --amp \
     --wandb-project         gs-distill \
     --wandb-run             siglip-vitb384-run1

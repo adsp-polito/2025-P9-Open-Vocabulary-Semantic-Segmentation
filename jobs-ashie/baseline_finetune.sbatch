@@ -41,7 +41,7 @@ echo "============================================================"
 echo "Baseline — GS-Distill arch, random init, fine-tune on LD50K"
 echo "  GSNet:   ${GSNET_WEIGHTS}"
 echo "  Images:  gs_net/data/datasets/LandDiscover_50K/TR_Image"
-echo "  Labels:  gs_net/data/datasets/LandDiscover_50K/TR_Label"
+echo "  Labels:  gs_net/data/datasets/LandDiscover_50K/GT_ID"
 echo "  Output:  output/ashie/baseline"
 echo "============================================================"
 echo "Job ID: ${SLURM_JOB_ID:-N/A}   Node: ${SLURM_NODELIST:-N/A}"
@@ -54,13 +54,14 @@ nvidia-smi
     --gsnet-config          configs/vitl_336_dinov3.yaml \
     --gsnet-weights         "${GSNET_WEIGHTS}" \
     --image-dir             gs_net/data/datasets/LandDiscover_50K/TR_Image \
-    --label-dir             gs_net/data/datasets/LandDiscover_50K/TR_Label \
+    --label-dir             gs_net/data/datasets/LandDiscover_50K/GT_ID \
     --output-dir            output/ashie/baseline \
     --epochs                15 \
-    --batch-size            4 \
+    --batch-size            1 \
+    --grad-accum            2 \
     --lr                    1e-5 \
     --unfreeze-ripd \
-    --num-workers           4 \
+    --num-workers           2 \
     --amp \
     --wandb-project         gs-distill \
     --wandb-run             baseline-vitl336-run1

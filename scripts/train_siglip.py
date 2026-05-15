@@ -790,14 +790,14 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
 
         train_loss = 0.0
         n_train_batches = 0
+        grad_accum = args.grad_accum
+        optimizer.zero_grad(set_to_none=True)
 
-        for images, labels in tqdm(train_loader, desc=f"[Finetune] Epoch {epoch+1}/{args.finetune_epochs} [train]"):
+        for step, (images, labels) in enumerate(tqdm(train_loader, desc=f"[Finetune] Epoch {epoch+1}/{args.finetune_epochs} [train]")):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             B = images.shape[0]
             tf = text_feats.expand(B, -1, -1, -1)
-
-            optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=args.amp):
                 logit = siglip_inference(
@@ -809,20 +809,26 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
                 )
                 logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                           mode="bilinear", align_corners=False)
-                loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx)
+                loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx) / grad_accum
 
             if args.amp:
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(active_params, 1.0)
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
-                nn.utils.clip_grad_norm_(active_params, 1.0)
-                optimizer.step()
 
-            train_loss += loss.item()
+            is_last_step = (step + 1 == len(train_loader))
+            if (step + 1) % grad_accum == 0 or is_last_step:
+                if args.amp:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(active_params, 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    nn.utils.clip_grad_norm_(active_params, 1.0)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            train_loss += loss.item() * grad_accum
             n_train_batches += 1
 
         student.eval()
@@ -894,6 +900,8 @@ def parse_args():
     p.add_argument("--siglip-layers",   type=int,   nargs="+", default=SIGLIP_LAYERS_DEFAULT)
     p.add_argument("--val-fraction",    type=float, default=0.05)
     p.add_argument("--num-workers",     type=int,   default=4)
+    p.add_argument("--grad-accum",      type=int,   default=1,
+                   help="Gradient accumulation steps (effective batch = batch-size * grad-accum).")
     p.add_argument("--amp",             action="store_true")
     p.add_argument("--device",          default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--log-interval",    type=int,   default=50)
