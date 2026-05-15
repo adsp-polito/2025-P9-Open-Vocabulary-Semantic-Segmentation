@@ -201,6 +201,11 @@ def main():
     dino_decod_proj1 = gsnet.dino_decod_proj1
     dino_decod_proj2 = gsnet.dino_decod_proj2
 
+    # RSIB and backbone are not used during fine-tune — free VRAM before training.
+    gsnet.dino_model = None
+    gsnet.backbone = None
+    torch.cuda.empty_cache()
+
     warmup        = args.warmup_decoder_epochs
     ripd_unfrozen = args.unfreeze_ripd or warmup > 0
 
