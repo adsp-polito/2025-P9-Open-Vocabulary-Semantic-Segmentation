@@ -43,6 +43,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as grad_ckpt
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
@@ -800,13 +801,41 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
             tf = text_feats.expand(B, -1, -1, -1)
 
             with autocast(enabled=args.amp):
-                logit = siglip_inference(
-                    image=images, text_feats=tf, student=student,
-                    siglip_model=siglip_model, ripd=ripd,
-                    clip_upsample1=clip_upsample1, clip_upsample2=clip_upsample2,
-                    dino_decod_proj1=dino_decod_proj1, dino_decod_proj2=dino_decod_proj2,
-                    skip_layer_indices=clip_skip_indices,
-                )
+                with torch.no_grad():
+                    cls_token, skips = get_siglip_skips(siglip_model, images,
+                                                         list(clip_skip_indices))
+                    l0, l1 = clip_skip_indices
+                    res4 = clip_upsample1(skips[l0]) if clip_upsample1 is not None else None
+                    res5 = clip_upsample2(skips[l1]) if clip_upsample2 is not None else None
+
+                student_out      = grad_ckpt.checkpoint(student, images, use_reentrant=False)
+                fused_corr_embed = student_out["fused_corr_embed"]
+                dino_L4_proj     = dino_decod_proj1(student_out["dino_L4"]) if dino_decod_proj1 is not None else None
+                dino_L8_proj     = dino_decod_proj2(student_out["dino_L8"]) if dino_decod_proj2 is not None else None
+                del student_out
+
+            res3 = rearrange(cls_token, "B (H W) C -> B C H W", H=24)
+            clip_guidance = {"res3": res3, "res4": res4, "res5": res5}
+            del cls_token, skips
+
+            _has_dg0 = dino_L4_proj is not None
+            _has_dg1 = dino_L8_proj is not None
+            _dg0 = dino_L4_proj if _has_dg0 else fused_corr_embed.new_zeros(1)
+            _dg1 = dino_L8_proj if _has_dg1 else fused_corr_embed.new_zeros(1)
+
+            def _ripd_fwd(fused, tf_, dg0, dg1):
+                with autocast(enabled=args.amp):
+                    return ripd.forward_from_fusion(
+                        fused_corr_embed=fused,
+                        text_feats=tf_,
+                        appearance_guidance=clip_guidance,
+                        dino_guidance=[dg0 if _has_dg0 else None,
+                                       dg1 if _has_dg1 else None],
+                    )
+
+            logit = grad_ckpt.checkpoint(_ripd_fwd, fused_corr_embed, tf, _dg0, _dg1, use_reentrant=False)
+
+            with autocast(enabled=args.amp):
                 logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                           mode="bilinear", align_corners=False)
                 loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx) / grad_accum
