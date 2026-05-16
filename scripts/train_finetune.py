@@ -382,7 +382,11 @@ def main():
                     res4 = clip_upsample1(clip_skips[l0]) if clip_upsample1 is not None else None
                     res5 = clip_upsample2(clip_skips[l1]) if clip_upsample2 is not None else None
 
-                student_out      = grad_ckpt.checkpoint(student, images, use_reentrant=False)
+                if student.training:
+                    student_out  = grad_ckpt.checkpoint(student, images, use_reentrant=False)
+                else:
+                    with torch.no_grad():
+                        student_out = student(images)
                 fused_corr_embed = student_out["fused_corr_embed"]
                 dino_L4_proj     = dino_decod_proj1(student_out["dino_L4"]) if dino_decod_proj1 is not None else None
                 dino_L8_proj     = dino_decod_proj2(student_out["dino_L8"]) if dino_decod_proj2 is not None else None
@@ -419,7 +423,9 @@ def main():
             with autocast(enabled=args.amp):
                 logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                          mode="bilinear", align_corners=False)
+                del logit
                 loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx) / grad_accum
+                del logit_up
 
             if args.amp:
                 scaler.scale(loss).backward()
