@@ -40,6 +40,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as grad_ckpt
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
@@ -53,7 +54,8 @@ from detectron2.config import get_cfg
 from detectron2.checkpoint import DetectionCheckpointer
 
 from gs_distill.student import GSDistillStudent
-from gs_distill.inference import gs_distill_inference
+from gs_distill.utils import get_clip_skips
+from einops import rearrange as _rearrange
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,20 +373,50 @@ def main():
             B = images.shape[0]
             tf = text_feats.expand(B, -1, -1, -1)   # (B, T, P, C)
 
+            # ── student + CLIP skips (cheap, under autocast) ──────────────────
             with autocast(enabled=args.amp):
-                logit = gs_distill_inference(
-                    image=images,
-                    text_feats=tf,
-                    student=student,
-                    clip_model=clip_model,
-                    ripd=ripd,
-                    clip_upsample1=clip_upsample1,
-                    clip_upsample2=clip_upsample2,
-                    dino_decod_proj1=dino_decod_proj1,
-                    dino_decod_proj2=dino_decod_proj2,
-                    clip_skip_layer_indices=clip_skip_indices,
-                )
-                # logit: (B, T, H, W)  labels: (B, H, W)
+                with torch.no_grad():
+                    clip_features, clip_skips = get_clip_skips(
+                        clip_model, images, list(clip_skip_indices))
+                    l0, l1 = clip_skip_indices
+                    res4 = clip_upsample1(clip_skips[l0]) if clip_upsample1 is not None else None
+                    res5 = clip_upsample2(clip_skips[l1]) if clip_upsample2 is not None else None
+
+                student_out      = grad_ckpt.checkpoint(student, images, use_reentrant=False)
+                fused_corr_embed = student_out["fused_corr_embed"]
+                dino_L4_proj     = dino_decod_proj1(student_out["dino_L4"]) if dino_decod_proj1 is not None else None
+                dino_L8_proj     = dino_decod_proj2(student_out["dino_L8"]) if dino_decod_proj2 is not None else None
+                # Free the full student_out dict — only the extracted tensors are needed
+                del student_out
+
+            clip_guidance = {
+                "res3": _rearrange(clip_features[:, 1:, :], "B (H W) C -> B C H W", H=24),
+                "res4": res4,
+                "res5": res5,
+            }
+            # Free raw CLIP skips — clip_guidance holds the only tensors needed downstream
+            del clip_features, clip_skips
+
+            # ── RIPD decoder: checkpoint to avoid retaining (B*T,C,H,W) graph ─
+            _has_dg0 = dino_L4_proj is not None
+            _has_dg1 = dino_L8_proj is not None
+            _dg0 = dino_L4_proj if _has_dg0 else fused_corr_embed.new_zeros(1)
+            _dg1 = dino_L8_proj if _has_dg1 else fused_corr_embed.new_zeros(1)
+
+            def _ripd_fwd(fused, tf_, dg0, dg1):
+                with autocast(enabled=args.amp):
+                    return ripd.forward_from_fusion(
+                        fused_corr_embed=fused,
+                        text_feats=tf_,
+                        appearance_guidance=clip_guidance,
+                        dino_guidance=[dg0 if _has_dg0 else None,
+                                       dg1 if _has_dg1 else None],
+                    )
+
+            logit = grad_ckpt.checkpoint(_ripd_fwd, fused_corr_embed, tf, _dg0, _dg1, use_reentrant=False)
+
+            # logit: (B, T, H, W)  labels: (B, H, W)
+            with autocast(enabled=args.amp):
                 logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                          mode="bilinear", align_corners=False)
                 loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx) / grad_accum
