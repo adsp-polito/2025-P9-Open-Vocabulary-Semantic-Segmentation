@@ -125,10 +125,12 @@ class GSDistillStudent(nn.Module):
 
     def trainable_parameters(self):
         """Return only the trainable (non-CLIP) parameters."""
-        return (
+        params = (
             list(self.shared_trunk.parameters())
             + list(self.fusion_branch.parameters())
-            + list(self.clip_embed_branch.parameters())
             + list(self.dino_l4_branch.parameters())
             + list(self.dino_l8_branch.parameters())
         )
+        if self.clip_embed_branch is not None:
+            params += list(self.clip_embed_branch.parameters())
+        return params

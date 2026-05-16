@@ -273,13 +273,15 @@ class SigLIPStudent(nn.Module):
         }
 
     def trainable_parameters(self):
-        return (
+        params = (
             list(self.shared_trunk.parameters())
             + list(self.fusion_branch.parameters())
-            + list(self.clip_embed_branch.parameters())
             + list(self.dino_l4_branch.parameters())
             + list(self.dino_l8_branch.parameters())
         )
+        if self.clip_embed_branch is not None:
+            params += list(self.clip_embed_branch.parameters())
+        return params
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -800,19 +802,54 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
             B = images.shape[0]
             tf = text_feats.expand(B, -1, -1, -1)
 
-            with autocast(enabled=args.amp):
-                with torch.no_grad():
+            # ── SigLIP forward (frozen, one pass for both RIPD skips + student trunk) ──
+            with torch.no_grad():
+                with autocast(enabled=args.amp):
                     cls_token, skips = get_siglip_skips(siglip_model, images,
                                                          list(clip_skip_indices))
                     l0, l1 = clip_skip_indices
                     res4 = clip_upsample1(skips[l0]) if clip_upsample1 is not None else None
                     res5 = clip_upsample2(skips[l1]) if clip_upsample2 is not None else None
+                    _stacked = extract_siglip_layers(siglip_model, images, student.siglip_layers)
 
-                student_out      = grad_ckpt.checkpoint(student, images, use_reentrant=False)
-                fused_corr_embed = student_out["fused_corr_embed"]
-                dino_L4_proj     = dino_decod_proj1(student_out["dino_L4"]) if dino_decod_proj1 is not None else None
-                dino_L8_proj     = dino_decod_proj2(student_out["dino_L8"]) if dino_decod_proj2 is not None else None
-                del student_out
+            # ── Student: per-branch checkpointing ────────────────────────────────
+            if student.training:
+                with autocast(enabled=args.amp):
+                    _trunk = grad_ckpt.checkpoint(student.shared_trunk, _stacked, use_reentrant=False)
+                del _stacked
+
+                def _fuse(_x):
+                    with autocast(enabled=args.amp):
+                        return rearrange(student.fusion_branch(_x),
+                                         "B (C T) H W -> B C T H W",
+                                         C=student.hidden_dim, T=student.num_classes)
+                fused_corr_embed = grad_ckpt.checkpoint(_fuse, _trunk, use_reentrant=False)
+
+                def _dl4(_x):
+                    with autocast(enabled=args.amp):
+                        return student.dino_l4_branch(_x)
+                _dino_L4 = grad_ckpt.checkpoint(_dl4, _trunk, use_reentrant=False) if dino_decod_proj1 is not None else None
+
+                def _dl8(_x):
+                    with autocast(enabled=args.amp):
+                        return student.dino_l8_branch(_x)
+                _dino_L8 = grad_ckpt.checkpoint(_dl8, _trunk, use_reentrant=False) if dino_decod_proj2 is not None else None
+                del _trunk
+            else:
+                with torch.no_grad(), autocast(enabled=args.amp):
+                    _trunk = student.shared_trunk(_stacked)
+                    del _stacked
+                    fused_corr_embed = rearrange(student.fusion_branch(_trunk),
+                                                 "B (C T) H W -> B C T H W",
+                                                 C=student.hidden_dim, T=student.num_classes)
+                    _dino_L4 = student.dino_l4_branch(_trunk) if dino_decod_proj1 is not None else None
+                    _dino_L8 = student.dino_l8_branch(_trunk) if dino_decod_proj2 is not None else None
+                    del _trunk
+
+            with autocast(enabled=args.amp):
+                dino_L4_proj = dino_decod_proj1(_dino_L4) if _dino_L4 is not None else None
+                dino_L8_proj = dino_decod_proj2(_dino_L8) if _dino_L8 is not None else None
+            del _dino_L4, _dino_L8
 
             res3 = rearrange(cls_token, "B (H W) C -> B C H W", H=24)
             clip_guidance = {"res3": res3, "res4": res4, "res5": res5}
