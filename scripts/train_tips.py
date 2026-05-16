@@ -871,13 +871,11 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
             _d0s = _d0 if _has_d0 else fused_corr_embed.new_zeros(1)
             _d1s = _d1 if _has_d1 else fused_corr_embed.new_zeros(1)
 
-            with autocast(enabled=args.amp):
-                _flat = rearrange(fused_corr_embed, 'B C T H W -> (B T) C H W')
-
             def _dec1(_x, _cg, _dg):
                 with autocast(enabled=args.amp):
+                    _x = rearrange(_x, 'B C T H W -> (B T) C H W')
                     return ripd.Fusiondecoder1(_x, _cg if _has_c0 else None, _dg if _has_d0 else None)
-            _flat = grad_ckpt.checkpoint(_dec1, _flat, _c0s, _d0s, use_reentrant=False)
+            _flat = grad_ckpt.checkpoint(_dec1, fused_corr_embed, _c0s, _d0s, use_reentrant=False)
 
             def _dec2(_x, _cg, _dg):
                 with autocast(enabled=args.amp):
