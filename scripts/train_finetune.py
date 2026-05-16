@@ -181,15 +181,29 @@ def create_subset(dataset, fraction, seed):
     from collections import defaultdict
 
     rng = np.random.RandomState(seed)
+    n = len(dataset)
 
-    # Determine dominant class per image (mode of valid pixels, ignoring 255)
-    print(f"Building stratification index for {len(dataset)} images ...")
-    strata = []
+    print(f"Building stratification index for {n} images ...")
+
+    # Pass 1: collect the set of classes present in each image and global class frequency
+    image_classes = []
+    class_freq = defaultdict(int)
     for _, lbl_path in dataset.samples:
         lbl = np.array(Image.open(lbl_path))
-        valid = lbl[lbl != 255]
-        dominant = int(np.bincount(valid).argmax()) if len(valid) > 0 else -1
-        strata.append(dominant)
+        present = set(lbl[lbl != 255].tolist())
+        image_classes.append(present)
+        for c in present:
+            class_freq[c] += 1
+
+    # Pass 2: assign each image to its rarest globally-present class so that
+    # every class that appears anywhere in the dataset becomes its own stratum.
+    strata = []
+    for present in image_classes:
+        if present:
+            stratum = min(present, key=lambda c: class_freq[c])
+        else:
+            stratum = -1
+        strata.append(stratum)
 
     # Sample proportionally from each stratum
     stratum_buckets = defaultdict(list)
@@ -198,12 +212,12 @@ def create_subset(dataset, fraction, seed):
 
     selected = []
     for s, idxs in sorted(stratum_buckets.items()):
-        n = max(1, round(len(idxs) * fraction))
-        chosen = rng.choice(idxs, min(n, len(idxs)), replace=False)
+        k = max(1, round(len(idxs) * fraction))
+        chosen = rng.choice(idxs, min(k, len(idxs)), replace=False)
         selected.extend(chosen.tolist())
 
     rng.shuffle(selected)
-    print(f"Dataset subset (stratified): {len(selected)} / {len(dataset)} images ({fraction*100:.0f}%)")
+    print(f"Dataset subset (stratified): {len(selected)} / {n} images ({fraction*100:.0f}%)")
     print(f"  Strata covered: {len(stratum_buckets)} classes")
     return Subset(dataset, selected)
 
