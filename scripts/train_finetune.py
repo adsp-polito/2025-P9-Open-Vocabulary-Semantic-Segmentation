@@ -282,6 +282,7 @@ def main():
         clip_layers=student_args.get("clip_layers", [4, 8, 10, 12]),
     ).to(device)
     student.load_state_dict(ckpt["student"])
+    student.clip_embed_branch = None  # distillation-only branch; saves ~47 MB during backward recompute
 
     if warmup > 0:
         # Phase 1: student fully frozen while the decoder warms up alone.

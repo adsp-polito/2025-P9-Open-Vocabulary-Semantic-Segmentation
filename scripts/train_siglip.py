@@ -1050,6 +1050,7 @@ def main():
     print(f"\nReloading best distill checkpoint: {best_distill_ckpt}")
     ckpt = torch.load(best_distill_ckpt, map_location=device)
     student.load_state_dict(ckpt["student"])
+    student.clip_embed_branch = None  # distillation-only branch; saves ~47 MB during backward recompute
 
     # ── Phase 3: Segmentation fine-tune ───────────────────────────────────────
     print("\n" + "="*60)

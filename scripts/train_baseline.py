@@ -220,6 +220,7 @@ def main():
         num_classes=args.num_classes,
         clip_layers=args.clip_layers,
     ).to(device)
+    student.clip_embed_branch = None  # distillation-only branch; saves ~47 MB during backward recompute
 
     n_params = sum(p.numel() for p in student.trainable_parameters())
     print(f"  Trainable params: {n_params / 1e6:.2f}M")
