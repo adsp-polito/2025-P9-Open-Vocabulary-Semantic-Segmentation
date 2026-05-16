@@ -267,7 +267,7 @@ class SigLIPStudent(nn.Module):
 
         return {
             "fused_corr_embed": _corr_reshape(self.fusion_branch(trunk_out)),
-            "clip_embed_corr":  _corr_reshape(self.clip_embed_branch(trunk_out)),
+            "clip_embed_corr":  _corr_reshape(self.clip_embed_branch(trunk_out)) if self.clip_embed_branch is not None else None,
             "dino_L4": self.dino_l4_branch(trunk_out),
             "dino_L8": self.dino_l8_branch(trunk_out),
         }
