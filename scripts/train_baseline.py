@@ -368,10 +368,39 @@ def main():
                         return _fn(_x, _pg if _has_pg else None, _ptg if _has_ptg else None)
                 fused_corr_embed = grad_ckpt.checkpoint(_agg, _layer, fused_corr_embed, _pg, _ptg, use_reentrant=False)
 
-            def _decoder(_x):
+            # -- inline Fusion_conv_decoer: checkpoint each upsample stage individually --
+            _B = fused_corr_embed.shape[0]
+            _c0 = _CLIP_proj[0]
+            _c1 = _CLIP_proj[1]
+            _d0 = _DINO_proj[0]
+            _d1 = _DINO_proj[1]
+            _has_c0 = _c0 is not None
+            _has_c1 = _c1 is not None
+            _has_d0 = _d0 is not None
+            _has_d1 = _d1 is not None
+            _c0s = _c0 if _has_c0 else fused_corr_embed.new_zeros(1)
+            _c1s = _c1 if _has_c1 else fused_corr_embed.new_zeros(1)
+            _d0s = _d0 if _has_d0 else fused_corr_embed.new_zeros(1)
+            _d1s = _d1 if _has_d1 else fused_corr_embed.new_zeros(1)
+
+            def _dec_init(_x):
                 with autocast(enabled=args.amp):
-                    return ripd.Fusion_conv_decoer(_x, _CLIP_proj, _DINO_proj)
-            logit = grad_ckpt.checkpoint(_decoder, fused_corr_embed, use_reentrant=False)
+                    return _rearrange(_x, 'B C T H W -> (B T) C H W')
+            _flat = _dec_init(fused_corr_embed)
+
+            def _dec1(_x, _cg, _dg):
+                with autocast(enabled=args.amp):
+                    return ripd.Fusiondecoder1(_x, _cg if _has_c0 else None, _dg if _has_d0 else None)
+            _flat = grad_ckpt.checkpoint(_dec1, _flat, _c0s, _d0s, use_reentrant=False)
+
+            def _dec2(_x, _cg, _dg):
+                with autocast(enabled=args.amp):
+                    return ripd.Fusiondecoder2(_x, _cg if _has_c1 else None, _dg if _has_d1 else None)
+            _flat = grad_ckpt.checkpoint(_dec2, _flat, _c1s, _d1s, use_reentrant=False)
+
+            with autocast(enabled=args.amp):
+                _flat = ripd.head(_flat)
+                logit = _rearrange(_flat, '(B T) () H W -> B T H W', B=_B)
 
             with autocast(enabled=args.amp):
                 logit_up = F.interpolate(logit, size=labels.shape[-2:],
