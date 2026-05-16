@@ -1,0 +1,13 @@
+{
+  "dataset": "Potsdam",
+  "num_classes": 5,
+  "ignore_label": 5,
+  "miou": 21.32,
+  "per_class_iou": {
+    "impervious surface": 1.81,
+    "building": 60.67,
+    "low vegetation": 4.9,
+    "tree": 35.7,
+    "car": 3.52
+  }
+}

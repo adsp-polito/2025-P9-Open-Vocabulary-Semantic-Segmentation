@@ -368,8 +368,7 @@ def main():
         print(f"  Saved → {out_path}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    teacher  = {"FloodNet": 48.40, "FAST": 18.53, "Potsdam": 44.11, "FLAIR": 28.18}
-    zeroshot = {"FloodNet": 4.27,  "FAST": 1.03,  "Potsdam": 13.27, "FLAIR": 4.65}
+    gsnet_original = {"FloodNet": 42.63, "FAST": 16.61, "Potsdam": 45.75, "FLAIR": 20.00}
 
     summary_out = {
         "mode":        f"Phase 3 fine-tuned student ({tag} init) + ClassAgnosticDecoder",
@@ -378,8 +377,7 @@ def main():
         "epoch":       epoch,
         "results":     summary,
         "baselines": {
-            "teacher":  teacher,
-            "zeroshot": zeroshot,
+            "gsnet_original": gsnet_original,
         },
     }
     summary_path = Path(args.results_dir) / "summary.json"
@@ -389,17 +387,16 @@ def main():
     print(f"\n{'='*65}")
     print(f"RESULTS — Phase 3 student ({tag} init) + ClassAgnosticDecoder")
     print(f"{'='*65}")
-    print(f"{'Dataset':<12} {'Student':>10} {'Zero-shot':>11} {'Teacher':>10}")
-    print(f"{'─'*46}")
+    print(f"{'Dataset':<12} {'Student':>10} {'GSNet-orig':>12}")
+    print(f"{'─'*38}")
     for ds, miou in summary.items():
-        zs = zeroshot.get(ds, "—")
-        t  = teacher.get(ds, "—")
-        print(f"{ds:<12} {miou:>9.2f}%  {zs:>10}%  {t:>9}%")
-    avg    = sum(summary.values()) / len(summary) if summary else 0
-    avg_zs = sum(zeroshot[d] for d in summary if d in zeroshot) / len(summary)
-    avg_t  = sum(teacher[d]  for d in summary if d in teacher)  / len(summary)
-    print(f"{'─'*46}")
-    print(f"{'Average':<12} {avg:>9.2f}%  {avg_zs:>10.2f}%  {avg_t:>9.2f}%")
+        g = gsnet_original.get(ds, "—")
+        delta = f"({miou - g:+.2f})" if isinstance(g, float) else ""
+        print(f"{ds:<12} {miou:>9.2f}%  {g:>10}%  {delta}")
+    avg   = sum(summary.values()) / len(summary) if summary else 0
+    avg_g = sum(gsnet_original[d] for d in summary if d in gsnet_original) / len(summary)
+    print(f"{'─'*38}")
+    print(f"{'Average':<12} {avg:>9.2f}%  {avg_g:>10.2f}%  ({avg - avg_g:+.2f})")
     print(f"\nFull results → {args.results_dir}/")
 
 

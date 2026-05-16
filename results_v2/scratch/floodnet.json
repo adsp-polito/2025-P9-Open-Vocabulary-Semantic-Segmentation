@@ -1,0 +1,18 @@
+{
+  "dataset": "FloodNet",
+  "num_classes": 10,
+  "ignore_label": 0,
+  "miou": 9.57,
+  "per_class_iou": {
+    "Background": 0.0,
+    "building-flooded": 0.0,
+    "building-non-flooded": 0.0,
+    "road-flooded": 0.01,
+    "road-non-flooded": 0.0,
+    "water": 33.82,
+    "tree": 16.62,
+    "vehicle": 21.43,
+    "pool": 0.0,
+    "grass": 23.77
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "dataset": "FLAIR",
+  "num_classes": 12,
+  "ignore_label": 12,
+  "miou": 14.7,
+  "per_class_iou": {
+    "building": 45.17,
+    "pervious-surface": 0.62,
+    "impervious-surface": 16.98,
+    "bare soil": 14.38,
+    "water": 37.2,
+    "coniferous": 5.34,
+    "deciduous": 12.13,
+    "brushwood": 0.03,
+    "vineyard": 0.0,
+    "herbaceous vegetation": 18.43,
+    "agricultural land": 25.44,
+    "plowed land": 0.69
+  }
+}

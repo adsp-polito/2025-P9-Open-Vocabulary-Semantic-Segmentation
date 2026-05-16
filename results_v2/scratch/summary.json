@@ -1,0 +1,20 @@
+{
+  "mode": "Phase 3 fine-tuned student (scratch init) + ClassAgnosticDecoder",
+  "checkpoint": "output_v2/finetune/scratch/student_best.pth",
+  "tag": "scratch",
+  "epoch": 20,
+  "results": {
+    "FloodNet": 9.57,
+    "FAST": 13.45,
+    "Potsdam": 18.95,
+    "FLAIR": 17.5
+  },
+  "baselines": {
+    "gsnet_original": {
+      "FloodNet": 42.63,
+      "FAST": 16.61,
+      "Potsdam": 45.75,
+      "FLAIR": 20.0
+    }
+  }
+}

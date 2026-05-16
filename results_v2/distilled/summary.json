@@ -1,0 +1,20 @@
+{
+  "mode": "Phase 3 fine-tuned student (distilled init) + ClassAgnosticDecoder",
+  "checkpoint": "output_v2/finetune/distilled/student_best.pth",
+  "tag": "distilled",
+  "epoch": 24,
+  "results": {
+    "FloodNet": 9.03,
+    "FAST": 12.44,
+    "Potsdam": 21.32,
+    "FLAIR": 14.7
+  },
+  "baselines": {
+    "gsnet_original": {
+      "FloodNet": 42.63,
+      "FAST": 16.61,
+      "Potsdam": 45.75,
+      "FLAIR": 20.0
+    }
+  }
+}
