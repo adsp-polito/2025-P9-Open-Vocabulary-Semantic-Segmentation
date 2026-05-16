@@ -823,17 +823,47 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
             _dg0 = dino_L4_proj if _has_dg0 else fused_corr_embed.new_zeros(1)
             _dg1 = dino_L8_proj if _has_dg1 else fused_corr_embed.new_zeros(1)
 
-            def _ripd_fwd(fused, tf_, dg0, dg1):
-                with autocast(enabled=args.amp):
-                    return ripd.forward_from_fusion(
-                        fused_corr_embed=fused,
-                        text_feats=tf_,
-                        appearance_guidance=clip_guidance,
-                        dino_guidance=[dg0 if _has_dg0 else None,
-                                       dg1 if _has_dg1 else None],
-                    )
+            # -- inline forward_from_fusion: guidance projections (cheap, no checkpoint) --
+            with autocast(enabled=args.amp):
+                _res3 = clip_guidance["res3"]
+                _res4 = clip_guidance["res4"]
+                _res5 = clip_guidance["res5"]
+                _projected_guidance = ripd.guidance_projection(_res3) if ripd.guidance_projection is not None else None
+                if ripd.text_guidance_projection is not None:
+                    _tf_mean = tf.mean(dim=-2)
+                    _tf_mean = _tf_mean / _tf_mean.norm(dim=-1, keepdim=True)
+                    _projected_text_guidance = ripd.text_guidance_projection(_tf_mean)
+                else:
+                    _projected_text_guidance = None
+                if ripd.CLIP_decoder_guidance_projection is not None:
+                    _CLIP_proj = [proj(g) for proj, g in zip(ripd.CLIP_decoder_guidance_projection, [_res4, _res5]) if g is not None]
+                    while len(_CLIP_proj) < 2:
+                        _CLIP_proj.append(None)
+                else:
+                    _CLIP_proj = [None, None]
+                if ripd.DINO_decoder_guidance_projection is not None:
+                    _DINO_proj = [proj(g) for proj, g in zip(ripd.DINO_decoder_guidance_projection, [dino_L4_proj, dino_L8_proj]) if g is not None]
+                    while len(_DINO_proj) < 2:
+                        _DINO_proj.append(None)
+                else:
+                    _DINO_proj = [None, None]
 
-            logit = grad_ckpt.checkpoint(_ripd_fwd, fused_corr_embed, tf, _dg0, _dg1, use_reentrant=False)
+            # -- per-AggregatorLayer checkpointing: each layer's ~11 MB freed before next --
+            _pg  = _projected_guidance      if _projected_guidance      is not None else fused_corr_embed.new_zeros(1)
+            _ptg = _projected_text_guidance if _projected_text_guidance is not None else fused_corr_embed.new_zeros(1)
+            _has_pg  = _projected_guidance      is not None
+            _has_ptg = _projected_text_guidance is not None
+
+            for _layer in ripd.layers:
+                def _agg(_fn, _x, _pg, _ptg):
+                    with autocast(enabled=args.amp):
+                        return _fn(_x, _pg if _has_pg else None, _ptg if _has_ptg else None)
+                fused_corr_embed = grad_ckpt.checkpoint(_agg, _layer, fused_corr_embed, _pg, _ptg, use_reentrant=False)
+
+            def _decoder(_x):
+                with autocast(enabled=args.amp):
+                    return ripd.Fusion_conv_decoer(_x, _CLIP_proj, _DINO_proj)
+            logit = grad_ckpt.checkpoint(_decoder, fused_corr_embed, use_reentrant=False)
 
             with autocast(enabled=args.amp):
                 logit_up = F.interpolate(logit, size=labels.shape[-2:],
