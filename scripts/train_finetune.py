@@ -23,6 +23,8 @@ Usage:
         [--batch-size 8] \\
         [--lr 1e-5] \\
         [--unfreeze-ripd] \\
+        [--ripd-decoder-class-chunk-size 10] \\
+        [--ripd-agg-layers 2] \\
         [--amp] \\
         [--device cuda]
 """
@@ -53,10 +55,11 @@ import wandb
 from detectron2.config import get_cfg
 from detectron2.checkpoint import DetectionCheckpointer
 
+from gs_distill.inference import gs_distill_inference
 from gs_distill.student import GSDistillStudent
 from gs_distill.utils import get_clip_skips, extract_clip_layers
 from einops import rearrange as _rearrange
-from ripd_lite import patch_ripd
+from ripd_lite import log_cuda_memory, patch_ripd, reset_cuda_memory_peak
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +138,14 @@ def parse_args():
                    help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
     p.add_argument("--grad-accum",     type=int,   default=1,
                    help="Gradient accumulation steps (effective batch = batch-size * grad-accum).")
+    p.add_argument("--ripd-decoder-class-chunk-size", type=int, default=0,
+                   help="Stream RIPD decoder tail over class chunks; 0 disables, 10 is recommended for 11 GB GPUs.")
+    p.add_argument(
+        "--ripd-agg-layers",
+        type=int,
+        default=0,
+        help="Use only the first N RIPD AggregatorLayers; 0 keeps all checkpoint-loaded layers.",
+    )
     p.add_argument("--amp",            action="store_true")
     p.add_argument("--num-workers",    type=int,   default=4)
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
@@ -449,10 +460,16 @@ def main():
                 loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx) / grad_accum
                 del logit_up
 
-            if args.amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            reset_cuda_memory_peak()
+            try:
+                if args.amp:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            except RuntimeError:
+                log_cuda_memory("after backward failed", reset_peak=False)
+                raise
+            log_cuda_memory("after backward")
 
             is_last_step = (step + 1 == len(train_loader))
             if (step + 1) % grad_accum == 0 or is_last_step:
