@@ -49,12 +49,15 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
-import clip as openai_clip
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from detectron2.config import get_cfg
 from detectron2.checkpoint import DetectionCheckpointer
 
+from gs_net.third_party import clip as openai_clip
 from gs_distill.inference import gs_distill_inference
 from gs_distill.student import GSDistillStudent
 from gs_distill.utils import get_clip_skips, extract_clip_layers
@@ -138,8 +141,8 @@ def parse_args():
                    help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
     p.add_argument("--grad-accum",     type=int,   default=1,
                    help="Gradient accumulation steps (effective batch = batch-size * grad-accum).")
-    p.add_argument("--ripd-decoder-class-chunk-size", type=int, default=0,
-                   help="Stream RIPD decoder tail over class chunks; 0 disables, 10 is recommended for 11 GB GPUs.")
+    p.add_argument("--ripd-decoder-class-chunk-size", type=int, default=10,
+                   help="Stream RIPD decoder tail over class chunks; 0 disables.")
     p.add_argument(
         "--ripd-agg-layers",
         type=int,
@@ -353,7 +356,9 @@ def main():
     best_val_loss = float("inf")
 
     # ── W&B ───────────────────────────────────────────────────────────────────
-    use_wandb = not args.no_wandb
+    use_wandb = not args.no_wandb and wandb is not None
+    if wandb is None and not args.no_wandb:
+        print("W&B is not installed; continuing without W&B logging.")
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
