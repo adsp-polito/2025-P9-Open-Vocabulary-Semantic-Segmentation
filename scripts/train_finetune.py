@@ -23,7 +23,7 @@ Usage:
         [--batch-size 8] \\
         [--lr 1e-5] \\
         [--unfreeze-ripd] \\
-        [--ripd-decoder-class-chunk-size 10] \\
+        [--ripd-decoder-class-chunk-size 5] \\
         [--ripd-agg-layers 2] \\
         [--amp] \\
         [--device cuda]
@@ -60,7 +60,7 @@ from detectron2.checkpoint import DetectionCheckpointer
 from gs_net.third_party import clip as openai_clip
 from gs_distill.inference import gs_distill_inference
 from gs_distill.student import GSDistillStudent
-from gs_distill.utils import get_clip_skips, extract_clip_layers
+from gs_distill.utils import get_clip_skips
 from einops import rearrange as _rearrange
 from ripd_lite import log_cuda_memory, patch_ripd, reset_cuda_memory_peak
 
@@ -141,8 +141,10 @@ def parse_args():
                    help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
     p.add_argument("--grad-accum",     type=int,   default=1,
                    help="Gradient accumulation steps (effective batch = batch-size * grad-accum).")
-    p.add_argument("--ripd-decoder-class-chunk-size", type=int, default=10,
+    p.add_argument("--ripd-decoder-class-chunk-size", type=int, default=5,
                    help="Stream RIPD decoder tail over class chunks; 0 disables.")
+    p.add_argument("--ripd-memory-logging", action="store_true",
+                   help="Print detailed CUDA memory checkpoints around RIPD forward/backward.")
     p.add_argument(
         "--ripd-agg-layers",
         type=int,
@@ -385,23 +387,29 @@ def main():
         n_train_batches = 0
         grad_accum = args.grad_accum
         optimizer.zero_grad(set_to_none=True)
+        # Merge RIPD skip indices and student layers — single CLIP forward per step.
+        _all_clip_layers = sorted(set(list(clip_skip_indices) + list(student.clip_layers)))
 
         for step, (images, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [train]")):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             B = images.shape[0]
-            tf = text_feats.expand(B, -1, -1, -1)   # (B, T, P, C)
+            # detach prevents text_feats.grad from silently accumulating across steps
+            # (text_feats is a plain GPU tensor, not a parameter, so zero_grad never clears it)
+            tf = text_feats.detach().expand(B, -1, -1, -1)   # (B, T, P, C)
 
             # ── CLIP forward (frozen, one pass for both RIPD skips + student trunk) ──
             with torch.no_grad():
                 with autocast(enabled=args.amp):
-                    clip_features, clip_skips = get_clip_skips(
-                        clip_model, images, list(clip_skip_indices))
+                    clip_features, _all_skips = get_clip_skips(
+                        clip_model, images, _all_clip_layers)
                     l0, l1 = clip_skip_indices
+                    clip_skips = {l: _all_skips[l] for l in clip_skip_indices}
                     res4 = clip_upsample1(clip_skips[l0]) if clip_upsample1 is not None else None
                     res5 = clip_upsample2(clip_skips[l1]) if clip_upsample2 is not None else None
-                    # Extract student trunk input (separate CLIP layers) — still frozen/no_grad
-                    _stacked = extract_clip_layers(clip_model, images, student.clip_layers)
+                    # Build student trunk input from the same single CLIP forward
+                    _stacked = torch.cat([_all_skips[l] for l in student.clip_layers], dim=1)
+                    del _all_skips
 
             # ── Student: per-branch checkpointing ────────────────────────────────
             if student.training:
@@ -465,7 +473,8 @@ def main():
                 loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx) / grad_accum
                 del logit_up
 
-            reset_cuda_memory_peak()
+            if args.ripd_memory_logging:
+                reset_cuda_memory_peak()
             try:
                 if args.amp:
                     scaler.scale(loss).backward()
@@ -474,7 +483,8 @@ def main():
             except RuntimeError:
                 log_cuda_memory("after backward failed", reset_peak=False)
                 raise
-            log_cuda_memory("after backward")
+            if args.ripd_memory_logging:
+                log_cuda_memory("after backward")
 
             is_last_step = (step + 1 == len(train_loader))
             if (step + 1) % grad_accum == 0 or is_last_step:

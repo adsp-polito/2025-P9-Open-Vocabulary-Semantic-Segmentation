@@ -316,7 +316,7 @@ def patch_ripd(ripd, args):
     agg_layers = int(getattr(args, "ripd_agg_layers", 0) or 0)
     _truncate_aggregator_layers(ripd, agg_layers)
 
-    chunk_size = int(getattr(args, "ripd_decoder_class_chunk_size", 10))
+    chunk_size = int(getattr(args, "ripd_decoder_class_chunk_size", 5))
     if chunk_size < 0:
         raise ValueError("--ripd-decoder-class-chunk-size must be >= 0")
 
@@ -333,9 +333,7 @@ def patch_ripd(ripd, args):
         ripd,
         amp=bool(getattr(args, "amp", False)),
         decoder_class_chunk_size=chunk_size,
-        memory_logging=bool(
-            getattr(args, "ripd_memory_logging", hasattr(args, "ripd_decoder_class_chunk_size"))
-        ),
+        memory_logging=bool(getattr(args, "ripd_memory_logging", False)),
     )
     ripd.forward_from_fusion = types.MethodType(new_method, ripd)
     print(

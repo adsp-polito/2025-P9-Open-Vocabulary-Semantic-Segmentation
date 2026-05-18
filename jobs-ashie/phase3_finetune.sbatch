@@ -69,7 +69,7 @@ nvidia-smi
     --batch-size            1 \
     --grad-accum            2 \
     --data-fraction         1.0 \
-    --ripd-decoder-class-chunk-size 10 \
+    --ripd-decoder-class-chunk-size 5 \
     --lr                    1e-5 \
     --warmup-decoder-epochs 3 \
     --num-workers           2 \
