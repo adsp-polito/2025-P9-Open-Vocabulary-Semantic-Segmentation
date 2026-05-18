@@ -18,10 +18,10 @@ Usage:
         --label-dir       path/to/LD50K/labels \\
         --output-dir      output/baseline/ \\
         [--epochs 15] \\
-        [--batch-size 4] \\
+        [--batch-size 1] \\
         [--lr 1e-5] \\
-        [--unfreeze-ripd] \\
-        [--warmup-decoder-epochs 3] \\
+        [--ripd-decoder-class-chunk-size 5] \\
+        [--ripd-agg-layers 2] \\
         [--amp] \\
         [--device cuda]
 """
@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.abspath('./detectron2'))
 sys.path.insert(0, os.path.abspath('.'))
 
 import argparse
+import gc
 import json
 from pathlib import Path
 
@@ -40,21 +41,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as grad_ckpt
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
-import clip as openai_clip
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from detectron2.config import get_cfg
 from detectron2.checkpoint import DetectionCheckpointer
 
+from gs_net.third_party import clip as openai_clip
+from gs_distill.inference import gs_distill_inference
 from gs_distill.student import GSDistillStudent
-from gs_distill.utils import get_clip_skips, extract_clip_layers
+from gs_distill.utils import get_clip_skips
 from einops import rearrange as _rearrange
-from ripd_lite import patch_ripd
+from ripd_lite import log_cuda_memory, patch_ripd, reset_cuda_memory_peak
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,10 +67,6 @@ from ripd_lite import patch_ripd
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SegDataset(Dataset):
-    """
-    Flat-folder RGB image + single-channel label dataset.
-    Label pixels are class indices in [0, num_classes-1]; 255 = ignore.
-    """
     EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
     def __init__(self, image_dir, label_dir, resolution=384,
@@ -124,7 +125,7 @@ def parse_args():
     p.add_argument("--class-json",     default="datasets/landdiscover.json")
     p.add_argument("--output-dir",     default="output/baseline")
     p.add_argument("--epochs",         type=int,   default=15)
-    p.add_argument("--batch-size",     type=int,   default=4)
+    p.add_argument("--batch-size",     type=int,   default=1)
     p.add_argument("--lr",             type=float, default=1e-5)
     p.add_argument("--weight-decay",   type=float, default=1e-4)
     p.add_argument("--hidden-dim",     type=int,   default=128)
@@ -132,14 +133,25 @@ def parse_args():
     p.add_argument("--num-classes",    type=int,   default=40)
     p.add_argument("--clip-layers",    type=int,   nargs="+", default=[4, 8, 10, 12])
     p.add_argument("--unfreeze-ripd",          action="store_true")
+    p.add_argument("--train-decoder-projections", action="store_true",
+                   help="Train GSNet CLIP/DINO decoder bridge projections while keeping RIPD frozen.")
     p.add_argument("--warmup-decoder-epochs",  type=int, default=0,
                    help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
     p.add_argument("--grad-accum",     type=int,   default=1,
                    help="Gradient accumulation steps (effective batch = batch-size * grad-accum).")
+    p.add_argument("--ripd-decoder-class-chunk-size", type=int, default=5,
+                   help="Stream RIPD decoder tail over class chunks; 0 disables.")
+    p.add_argument("--ripd-memory-logging", action="store_true",
+                   help="Print detailed CUDA memory checkpoints around RIPD forward/backward.")
+    p.add_argument("--ripd-agg-layers", type=int, default=0,
+                   help="Use only the first N RIPD AggregatorLayers; 0 keeps all.")
     p.add_argument("--amp",            action="store_true")
     p.add_argument("--num-workers",    type=int,   default=4)
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--val-fraction",   type=float, default=0.05)
+    p.add_argument("--data-fraction",  type=float, default=1.0,
+                   help="Fraction of dataset to use (e.g. 0.5 = 50%%). Fixed-seed random subset.")
+    p.add_argument("--data-seed",      type=int,   default=42)
     p.add_argument("--wandb-project",  default="gs-distill")
     p.add_argument("--wandb-run",      default=None, help="W&B run name (auto if omitted)")
     p.add_argument("--no-wandb",       action="store_true", help="Disable W&B logging")
@@ -160,6 +172,36 @@ def build_gsnet(config_file, weights_file, device):
     return model
 
 
+def remove_gsnet_clip_cache_hooks(gsnet):
+    """Remove GSNet's permanent CLIP skip hooks; fine-tune uses temporary hooks."""
+    clip_model = gsnet.sem_seg_head.predictor.clip_model
+    removed = 0
+    for idx in getattr(gsnet, "layer_indexes", []):
+        block = clip_model.visual.transformer.resblocks[idx]
+        for hook_id, hook in list(block._forward_hooks.items()):
+            closure = getattr(hook, "__closure__", None) or ()
+            if any(cell.cell_contents is gsnet for cell in closure):
+                del block._forward_hooks[hook_id]
+                removed += 1
+    if hasattr(gsnet, "layers"):
+        gsnet.layers.clear()
+    if removed:
+        print(f"  Removed {removed} GSNet CLIP cache hooks.")
+
+
+def release_unused_gsnet(gsnet):
+    """Drop GSNet container references after extracting the modules fine-tune needs."""
+    gsnet.dino_model = None
+    gsnet.backbone = None
+    gsnet.sem_seg_head = None
+    gsnet.upsample1 = None
+    gsnet.upsample2 = None
+    gsnet.dino_decod_proj1 = None
+    gsnet.dino_decod_proj2 = None
+    if hasattr(gsnet, "layers"):
+        gsnet.layers.clear()
+
+
 def build_text_features(class_json, clip_model, device):
     with open(class_json) as f:
         class_names = json.load(f)
@@ -176,15 +218,56 @@ def build_text_features(class_json, clip_model, device):
     return text_feats
 
 
+def create_subset(dataset, fraction, seed):
+    from torch.utils.data import Subset
+    from collections import defaultdict
+
+    rng = np.random.RandomState(seed)
+    n = len(dataset)
+
+    print(f"Building stratification index for {n} images ...")
+
+    image_classes = []
+    class_freq = defaultdict(int)
+    for _, lbl_path in dataset.samples:
+        lbl = np.array(Image.open(lbl_path))
+        present = set(lbl[lbl != 255].tolist())
+        image_classes.append(present)
+        for c in present:
+            class_freq[c] += 1
+
+    strata = []
+    for present in image_classes:
+        if present:
+            stratum = min(present, key=lambda c: class_freq[c])
+        else:
+            stratum = -1
+        strata.append(stratum)
+
+    stratum_buckets = defaultdict(list)
+    for idx, s in enumerate(strata):
+        stratum_buckets[s].append(idx)
+
+    selected = []
+    for s, idxs in sorted(stratum_buckets.items()):
+        k = max(1, round(len(idxs) * fraction))
+        chosen = rng.choice(idxs, min(k, len(idxs)), replace=False)
+        selected.extend(chosen.tolist())
+
+    rng.shuffle(selected)
+    print(f"Dataset subset (stratified): {len(selected)} / {n} images ({fraction*100:.0f}%)")
+    print(f"  Strata covered: {len(stratum_buckets)} classes")
+    return Subset(dataset, selected)
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device)
 
-    # ── Load GSNet (to extract CLIP, RIPD + projection layers) ──────────────
+    # ── Load GSNet on CPU (to extract CLIP, RIPD + projection layers) ────────
     print("Loading GSNet ...")
-    gsnet = build_gsnet(args.gsnet_config, args.gsnet_weights, str(device))
-    gsnet = gsnet.to(device)
+    gsnet = build_gsnet(args.gsnet_config, args.gsnet_weights, "cpu")
 
     clip_model = gsnet.sem_seg_head.predictor.clip_model
     clip_model.eval()
@@ -192,6 +275,7 @@ def main():
         p.requires_grad = False
 
     clip_skip_indices = tuple(gsnet.layer_indexes)
+    remove_gsnet_clip_cache_hooks(gsnet)
 
     ripd             = gsnet.sem_seg_head.predictor.transformer
     patch_ripd(ripd, args)
@@ -200,18 +284,30 @@ def main():
     dino_decod_proj1 = gsnet.dino_decod_proj1
     dino_decod_proj2 = gsnet.dino_decod_proj2
 
+    decoder_proj_modules = [m for m in [clip_upsample1, clip_upsample2,
+                                         dino_decod_proj1, dino_decod_proj2]
+                             if m is not None]
+
+    release_unused_gsnet(gsnet)
+    del gsnet
+    gc.collect()
+
+    clip_model = clip_model.to(device)
+    ripd = ripd.to(device)
+    for m in decoder_proj_modules:
+        m.to(device)
+    torch.cuda.empty_cache()
+
     warmup        = args.warmup_decoder_epochs
     ripd_unfrozen = args.unfreeze_ripd or warmup > 0
+    decoder_proj_unfrozen = ripd_unfrozen or args.train_decoder_projections
 
     for p in ripd.parameters():
         p.requires_grad = ripd_unfrozen
 
-    decoder_proj_modules = [m for m in [clip_upsample1, clip_upsample2,
-                                         dino_decod_proj1, dino_decod_proj2]
-                             if m is not None]
     for m in decoder_proj_modules:
         for p in m.parameters():
-            p.requires_grad = ripd_unfrozen
+            p.requires_grad = decoder_proj_unfrozen
 
     # ── Build student from scratch (random init — no distillation) ───────────
     print("Building baseline student (random init, same arch as GS-Distill) ...")
@@ -222,7 +318,7 @@ def main():
         num_classes=args.num_classes,
         clip_layers=args.clip_layers,
     ).to(device)
-    student.clip_embed_branch = None  # distillation-only branch; saves ~47 MB during backward recompute
+    student.clip_embed_branch = None  # distillation-only branch; not needed for inference
 
     n_params = sum(p.numel() for p in student.trainable_parameters())
     print(f"  Trainable params: {n_params / 1e6:.2f}M")
@@ -233,15 +329,22 @@ def main():
         print(f"  Student frozen for {warmup}-epoch RIPD warmup.")
     elif ripd_unfrozen:
         print("  RIPD unfrozen for joint fine-tuning.")
+    else:
+        print("  RIPD frozen; student heads train against frozen RIPD decoder.")
+    if decoder_proj_unfrozen:
+        print("  Decoder bridge projections trainable.")
 
-    # ── Text features ─────────────────────────────────────────────────────────
+    # ── Text features (frozen) ────────────────────────────────────────────────
     text_feats = build_text_features(args.class_json, clip_model, device)
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     full_ds = SegDataset(args.image_dir, args.label_dir)
+    if args.data_fraction < 1.0:
+        full_ds = create_subset(full_ds, args.data_fraction, args.data_seed)
     n_val   = max(1, int(len(full_ds) * args.val_fraction))
     n_train = len(full_ds) - n_val
     gen = torch.Generator().manual_seed(42)
+    from torch.utils.data import random_split
     train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=gen)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
@@ -263,11 +366,17 @@ def main():
         return [p for m in decoder_proj_modules for p in m.parameters()]
 
     if warmup > 0:
-        active_params = list(ripd.parameters()) + _decoder_proj_params()
+        active_params = []
+        if ripd_unfrozen:
+            active_params += list(ripd.parameters())
+        if decoder_proj_unfrozen:
+            active_params += _decoder_proj_params()
     else:
         active_params = _student_head_params()
         if ripd_unfrozen:
-            active_params += list(ripd.parameters()) + _decoder_proj_params()
+            active_params += list(ripd.parameters())
+        if decoder_proj_unfrozen:
+            active_params += _decoder_proj_params()
 
     optimizer  = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
     scaler     = GradScaler(enabled=args.amp)
@@ -275,7 +384,9 @@ def main():
     best_val_loss = float("inf")
 
     # ── W&B ───────────────────────────────────────────────────────────────────
-    use_wandb = not args.no_wandb
+    use_wandb = not args.no_wandb and wandb is not None
+    if wandb is None and not args.no_wandb:
+        print("W&B is not installed; continuing without W&B logging.")
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
@@ -288,7 +399,11 @@ def main():
         if warmup > 0 and epoch == warmup:
             for p in _student_head_params():
                 p.requires_grad = True
-            active_params = _student_head_params() + list(ripd.parameters()) + _decoder_proj_params()
+            active_params = _student_head_params()
+            if ripd_unfrozen:
+                active_params += list(ripd.parameters())
+            if decoder_proj_unfrozen:
+                active_params += _decoder_proj_params()
             optimizer = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
             print(f"  Epoch {epoch+1}: student heads unfrozen — joint fine-tuning begins.")
 
@@ -301,22 +416,27 @@ def main():
         n_train_batches = 0
         grad_accum = args.grad_accum
         optimizer.zero_grad(set_to_none=True)
+        _all_clip_layers = sorted(set(list(clip_skip_indices) + list(student.clip_layers)))
 
         for step, (images, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [train]")):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             B = images.shape[0]
-            tf = text_feats.expand(B, -1, -1, -1)
+            tf = text_feats.detach().expand(B, -1, -1, -1)
 
-            # ── CLIP forward (frozen, one pass for both RIPD skips + student trunk) ──
+            # ── CLIP forward (frozen, single pass for RIPD skips + student trunk) ──
             with torch.no_grad():
                 with autocast(enabled=args.amp):
-                    clip_features, clip_skips = get_clip_skips(
-                        clip_model, images, list(clip_skip_indices))
+                    clip_features, _all_skips = get_clip_skips(
+                        clip_model, images, _all_clip_layers)
                     l0, l1 = clip_skip_indices
-                    res4 = clip_upsample1(clip_skips[l0]) if clip_upsample1 is not None else None
-                    res5 = clip_upsample2(clip_skips[l1]) if clip_upsample2 is not None else None
-                    _stacked = extract_clip_layers(clip_model, images, student.clip_layers)
+                    clip_skips = {l: _all_skips[l] for l in clip_skip_indices}
+                    _stacked = torch.cat([_all_skips[l] for l in student.clip_layers], dim=1)
+                    del _all_skips
+
+            with autocast(enabled=args.amp):
+                res4 = clip_upsample1(clip_skips[l0]) if clip_upsample1 is not None else None
+                res5 = clip_upsample2(clip_skips[l1]) if clip_upsample2 is not None else None
 
             # ── Student: per-branch checkpointing ────────────────────────────────
             if student.training:
@@ -374,12 +494,23 @@ def main():
             with autocast(enabled=args.amp):
                 logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                          mode="bilinear", align_corners=False)
+                del logit
                 loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx) / grad_accum
+                del logit_up
+            loss_value = loss.detach().item() * grad_accum
 
-            if args.amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            if args.ripd_memory_logging:
+                reset_cuda_memory_peak()
+            try:
+                if args.amp:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            except RuntimeError:
+                log_cuda_memory("after backward failed", reset_peak=False)
+                raise
+            if args.ripd_memory_logging:
+                log_cuda_memory("after backward")
 
             is_last_step = (step + 1 == len(train_loader))
             if (step + 1) % grad_accum == 0 or is_last_step:
@@ -393,8 +524,11 @@ def main():
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            train_loss += loss.item() * grad_accum
+            train_loss += loss_value
             n_train_batches += 1
+            del loss, loss_value, fused_corr_embed, tf, clip_guidance, dino_L4_proj, dino_L8_proj
+            del res4, res5
+            del images, labels
 
         # Validation
         student.eval()
@@ -407,7 +541,7 @@ def main():
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
                 B = images.shape[0]
-                tf = text_feats.expand(B, -1, -1, -1)
+                tf = text_feats.detach().expand(B, -1, -1, -1)
                 with autocast(enabled=args.amp):
                     logit = gs_distill_inference(
                         image=images, text_feats=tf, student=student,
@@ -418,9 +552,12 @@ def main():
                     )
                     logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                              mode="bilinear", align_corners=False)
+                    del logit
                     loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx)
+                    del logit_up
                 val_loss += loss.item()
                 n_val_batches += 1
+                del loss, tf, images, labels
 
         avg_train = train_loss / max(n_train_batches, 1)
         avg_val   = val_loss   / max(n_val_batches,   1)
@@ -440,11 +577,12 @@ def main():
             "epoch":   epoch,
             "student": student.state_dict(),
             "ripd":    ripd.state_dict() if ripd_unfrozen else None,
-            "clip_upsample1":   clip_upsample1.state_dict()   if ripd_unfrozen and clip_upsample1   is not None else None,
-            "clip_upsample2":   clip_upsample2.state_dict()   if ripd_unfrozen and clip_upsample2   is not None else None,
-            "dino_decod_proj1": dino_decod_proj1.state_dict() if ripd_unfrozen and dino_decod_proj1 is not None else None,
-            "dino_decod_proj2": dino_decod_proj2.state_dict() if ripd_unfrozen and dino_decod_proj2 is not None else None,
+            "clip_upsample1":   clip_upsample1.state_dict()  if decoder_proj_unfrozen and clip_upsample1  is not None else None,
+            "clip_upsample2":   clip_upsample2.state_dict()  if decoder_proj_unfrozen and clip_upsample2  is not None else None,
+            "dino_decod_proj1": dino_decod_proj1.state_dict() if decoder_proj_unfrozen and dino_decod_proj1 is not None else None,
+            "dino_decod_proj2": dino_decod_proj2.state_dict() if decoder_proj_unfrozen and dino_decod_proj2 is not None else None,
             "val_loss": avg_val,
+            "args": vars(args),
         }, os.path.join(args.output_dir, "baseline_latest.pth"))
 
         if avg_val < best_val_loss:
@@ -454,11 +592,12 @@ def main():
                 "epoch":   epoch,
                 "student": student.state_dict(),
                 "ripd":    ripd.state_dict() if ripd_unfrozen else None,
-                "clip_upsample1":   clip_upsample1.state_dict()   if ripd_unfrozen and clip_upsample1   is not None else None,
-                "clip_upsample2":   clip_upsample2.state_dict()   if ripd_unfrozen and clip_upsample2   is not None else None,
-                "dino_decod_proj1": dino_decod_proj1.state_dict() if ripd_unfrozen and dino_decod_proj1 is not None else None,
-                "dino_decod_proj2": dino_decod_proj2.state_dict() if ripd_unfrozen and dino_decod_proj2 is not None else None,
+                "clip_upsample1":   clip_upsample1.state_dict()  if decoder_proj_unfrozen and clip_upsample1  is not None else None,
+                "clip_upsample2":   clip_upsample2.state_dict()  if decoder_proj_unfrozen and clip_upsample2  is not None else None,
+                "dino_decod_proj1": dino_decod_proj1.state_dict() if decoder_proj_unfrozen and dino_decod_proj1 is not None else None,
+                "dino_decod_proj2": dino_decod_proj2.state_dict() if decoder_proj_unfrozen and dino_decod_proj2 is not None else None,
                 "val_loss": avg_val,
+                "args": vars(args),
             }, best_path)
             print(f"  ✓ New best val loss: {avg_val:.4f} → {best_path}")
 

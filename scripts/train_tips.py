@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.abspath('./detectron2'))
 sys.path.insert(0, os.path.abspath('.'))
 
 import argparse
+import gc
 import json
 import math
 import time
@@ -509,6 +510,36 @@ def build_teacher(config_file, weights_file, device):
 # Text features — uses teacher CLIP text encoder (same as all other scripts)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def remove_gsnet_clip_cache_hooks(gsnet):
+    """Remove GSNet's permanent CLIP image hooks; this script uses explicit hooks."""
+    clip_model = gsnet.sem_seg_head.predictor.clip_model
+    removed = 0
+    for idx in getattr(gsnet, "layer_indexes", []):
+        block = clip_model.visual.transformer.resblocks[idx]
+        for hook_id, hook in list(block._forward_hooks.items()):
+            closure = getattr(hook, "__closure__", None) or ()
+            if any(cell.cell_contents is gsnet for cell in closure):
+                del block._forward_hooks[hook_id]
+                removed += 1
+    if hasattr(gsnet, "layers"):
+        gsnet.layers.clear()
+    if removed:
+        print(f"  Removed {removed} GSNet CLIP cache hooks.")
+
+
+def release_unused_gsnet(gsnet):
+    """Drop GSNet container references after extracting fine-tune modules."""
+    gsnet.dino_model = None
+    gsnet.backbone = None
+    gsnet.sem_seg_head = None
+    gsnet.upsample1 = None
+    gsnet.upsample2 = None
+    gsnet.dino_decod_proj1 = None
+    gsnet.dino_decod_proj2 = None
+    if hasattr(gsnet, "layers"):
+        gsnet.layers.clear()
+
+
 def build_text_features(class_json, clip_model, device):
     import clip as openai_clip
     with open(class_json) as f:
@@ -716,6 +747,7 @@ def run_distillation(args, teacher, student, device, output_dir, use_wandb):
 def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb):
     clip_model        = gsnet.sem_seg_head.predictor.clip_model
     clip_skip_indices = tuple(gsnet.layer_indexes)
+    remove_gsnet_clip_cache_hooks(gsnet)
 
     ripd              = gsnet.sem_seg_head.predictor.transformer
     patch_ripd(ripd, args)
@@ -725,14 +757,18 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
     dino_decod_proj2  = gsnet.dino_decod_proj2
 
     for p in ripd.parameters():
-        p.requires_grad = True
+        p.requires_grad = False
 
     decoder_proj_modules = [m for m in [clip_upsample1, clip_upsample2,
                                          dino_decod_proj1, dino_decod_proj2]
                              if m is not None]
     for m in decoder_proj_modules:
         for p in m.parameters():
-            p.requires_grad = True
+            p.requires_grad = False
+
+    release_unused_gsnet(gsnet)
+    gc.collect()
+    torch.cuda.empty_cache()
 
     text_feats = build_text_features(args.class_json, clip_model, device)
 
@@ -759,11 +795,7 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
     def _decoder_proj_params():
         return [p for m in decoder_proj_modules for p in m.parameters()]
 
-    active_params = (
-        _student_head_params()
-        + list(ripd.parameters())
-        + _decoder_proj_params()
-    )
+    active_params = _student_head_params()
 
     optimizer  = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
     scaler     = GradScaler(enabled=args.amp)
@@ -775,40 +807,41 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
         torch.save({
             "epoch": epoch,
             "student": student.state_dict(),
-            "ripd": ripd.state_dict(),
-            "clip_upsample1":   clip_upsample1.state_dict()   if clip_upsample1   is not None else None,
-            "clip_upsample2":   clip_upsample2.state_dict()   if clip_upsample2   is not None else None,
-            "dino_decod_proj1": dino_decod_proj1.state_dict() if dino_decod_proj1 is not None else None,
-            "dino_decod_proj2": dino_decod_proj2.state_dict() if dino_decod_proj2 is not None else None,
+            "ripd": None,
+            "clip_upsample1":   None,
+            "clip_upsample2":   None,
+            "dino_decod_proj1": None,
+            "dino_decod_proj2": None,
             "val_loss": avg_val,
             "args": vars(args),
         }, path)
 
     for epoch in range(args.finetune_epochs):
         student.train()
-        ripd.train()
+        ripd.eval()
 
         train_loss = 0.0
         n_train_batches = 0
         grad_accum = args.grad_accum
         optimizer.zero_grad(set_to_none=True)
+        _all_tips_layers = sorted(set(list(clip_skip_indices) + list(student.tips_layers)))
 
         for step, (images, labels) in enumerate(tqdm(train_loader,
                                     desc=f"[Finetune] Epoch {epoch+1}/{args.finetune_epochs} [train]")):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             B = images.shape[0]
-            tf = text_feats.expand(B, -1, -1, -1)
+            tf = text_feats.detach().expand(B, -1, -1, -1)
 
             # ── TIPSv2 forward (frozen, one pass for both RIPD skips + student trunk) ──
             with torch.no_grad():
                 with autocast(enabled=args.amp):
                     last_hidden, skips = get_tips_skips(tips_model, images,
-                                                         list(clip_skip_indices))
+                                                         _all_tips_layers)
                     l0, l1 = clip_skip_indices
                     res4 = clip_upsample1(skips[l0]) if clip_upsample1 is not None else None
                     res5 = clip_upsample2(skips[l1]) if clip_upsample2 is not None else None
-                    _stacked = extract_tips_layers(tips_model, images, student.tips_layers)
+                    _stacked = torch.cat([skips[l] for l in student.tips_layers], dim=1)
 
             # ── Student: per-branch checkpointing ────────────────────────────────
             if student.training:
@@ -851,7 +884,6 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
 
             res3 = rearrange(last_hidden, "B (H W) C -> B C H W", H=32)
             clip_guidance = {"res3": res3, "res4": res4, "res5": res5}
-            del last_hidden, skips
 
             logit = ripd.forward_from_fusion(
                 fused_corr_embed=fused_corr_embed,
@@ -863,7 +895,10 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
             with autocast(enabled=args.amp):
                 logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                           mode="bilinear", align_corners=False)
+                del logit
                 loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx) / grad_accum
+                del logit_up
+            loss_value = loss.detach().item() * grad_accum
 
             if args.amp:
                 scaler.scale(loss).backward()
@@ -882,8 +917,10 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            train_loss += loss.item() * grad_accum
+            train_loss += loss_value
             n_train_batches += 1
+            del loss, loss_value, fused_corr_embed, tf, clip_guidance, dino_L4_proj, dino_L8_proj
+            del res3, res4, res5, last_hidden, skips, images, labels
 
         student.eval()
         ripd.eval()

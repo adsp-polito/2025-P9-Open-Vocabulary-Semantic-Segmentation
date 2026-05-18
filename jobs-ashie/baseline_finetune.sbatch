@@ -59,8 +59,11 @@ nvidia-smi
     --epochs                15 \
     --batch-size            1 \
     --grad-accum            2 \
+    --data-fraction         1.0 \
+    --ripd-decoder-class-chunk-size 5 \
+    --ripd-agg-layers       2 \
     --lr                    1e-5 \
-    --unfreeze-ripd \
+    --warmup-decoder-epochs 0 \
     --num-workers           2 \
     --amp \
     --wandb-project         gs-distill \
