@@ -472,6 +472,7 @@ def main():
                 del logit
                 loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx) / grad_accum
                 del logit_up
+            loss_value = loss.detach().item() * grad_accum
 
             if args.ripd_memory_logging:
                 reset_cuda_memory_peak()
@@ -498,8 +499,10 @@ def main():
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            train_loss += loss.item() * grad_accum
+            train_loss += loss_value
             n_train_batches += 1
+            del loss, loss_value, fused_corr_embed, tf, clip_guidance, dino_L4_proj, dino_L8_proj
+            del images, labels
 
         # Validation
         student.eval()
@@ -512,7 +515,7 @@ def main():
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
                 B = images.shape[0]
-                tf = text_feats.expand(B, -1, -1, -1)
+                tf = text_feats.detach().expand(B, -1, -1, -1)
                 with autocast(enabled=args.amp):
                     logit = gs_distill_inference(
                         image=images, text_feats=tf, student=student,
@@ -523,9 +526,12 @@ def main():
                     )
                     logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                              mode="bilinear", align_corners=False)
+                    del logit
                     loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx)
+                    del logit_up
                 val_loss += loss.item()
                 n_val_batches += 1
+                del loss, tf, images, labels
 
         avg_train = train_loss / max(n_train_batches, 1)
         avg_val   = val_loss   / max(n_val_batches,   1)
