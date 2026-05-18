@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.abspath('./detectron2'))
 sys.path.insert(0, os.path.abspath('.'))
 
 import argparse
+import gc
 import json
 import time
 from pathlib import Path
@@ -180,6 +181,36 @@ def build_gsnet(config_file, weights_file, device):
     return model
 
 
+def remove_gsnet_clip_cache_hooks(gsnet):
+    """Remove GSNet's permanent CLIP skip hooks; fine-tune uses temporary hooks."""
+    clip_model = gsnet.sem_seg_head.predictor.clip_model
+    removed = 0
+    for idx in getattr(gsnet, "layer_indexes", []):
+        block = clip_model.visual.transformer.resblocks[idx]
+        for hook_id, hook in list(block._forward_hooks.items()):
+            closure = getattr(hook, "__closure__", None) or ()
+            if any(cell.cell_contents is gsnet for cell in closure):
+                del block._forward_hooks[hook_id]
+                removed += 1
+    if hasattr(gsnet, "layers"):
+        gsnet.layers.clear()
+    if removed:
+        print(f"  Removed {removed} GSNet CLIP cache hooks.")
+
+
+def release_unused_gsnet(gsnet):
+    """Drop GSNet container references after extracting the modules fine-tune needs."""
+    gsnet.dino_model = None
+    gsnet.backbone = None
+    gsnet.sem_seg_head = None
+    gsnet.upsample1 = None
+    gsnet.upsample2 = None
+    gsnet.dino_decod_proj1 = None
+    gsnet.dino_decod_proj2 = None
+    if hasattr(gsnet, "layers"):
+        gsnet.layers.clear()
+
+
 def build_text_features(class_json, clip_model, device):
     with open(class_json) as f:
         class_names = json.load(f)
@@ -250,8 +281,7 @@ def main():
 
     # ── Load GSNet (to extract CLIP, RIPD + projection layers) ──────────────
     print("Loading GSNet ...")
-    gsnet = build_gsnet(args.gsnet_config, args.gsnet_weights, str(device))
-    gsnet = gsnet.to(device)
+    gsnet = build_gsnet(args.gsnet_config, args.gsnet_weights, "cpu")
 
     # Reuse the teacher's fine-tuned CLIP — correct architecture (ViT-L/14@336)
     # and the attention tuning from GSNet pretraining.
@@ -263,6 +293,7 @@ def main():
     # Layer indices for CLIP skip extraction depend on architecture
     # (ViT-B/16: [3,7], ViT-L/14@336: [7,15]) — read directly from the loaded model.
     clip_skip_indices = tuple(gsnet.layer_indexes)
+    remove_gsnet_clip_cache_hooks(gsnet)
 
     # forward_from_fusion lives on the RIPD transformer, not on the predictor wrapper.
     ripd            = gsnet.sem_seg_head.predictor.transformer
@@ -273,8 +304,18 @@ def main():
     dino_decod_proj2 = gsnet.dino_decod_proj2
 
     # RSIB and backbone are not used during fine-tune — free VRAM before training.
-    gsnet.dino_model = None
-    gsnet.backbone = None
+    decoder_proj_modules = [m for m in [clip_upsample1, clip_upsample2,
+                                         dino_decod_proj1, dino_decod_proj2]
+                             if m is not None]
+
+    release_unused_gsnet(gsnet)
+    del gsnet
+    gc.collect()
+
+    clip_model = clip_model.to(device)
+    ripd = ripd.to(device)
+    for m in decoder_proj_modules:
+        m.to(device)
     torch.cuda.empty_cache()
 
     warmup        = args.warmup_decoder_epochs
@@ -284,9 +325,6 @@ def main():
     for p in ripd.parameters():
         p.requires_grad = ripd_unfrozen
 
-    decoder_proj_modules = [m for m in [clip_upsample1, clip_upsample2,
-                                         dino_decod_proj1, dino_decod_proj2]
-                             if m is not None]
     for m in decoder_proj_modules:
         for p in m.parameters():
             p.requires_grad = decoder_proj_unfrozen

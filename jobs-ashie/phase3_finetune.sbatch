@@ -73,7 +73,6 @@ nvidia-smi
     --ripd-agg-layers       2 \
     --lr                    1e-5 \
     --warmup-decoder-epochs 0 \
-    --train-decoder-projections \
     --num-workers           2 \
     --amp \
     --wandb-project         gs-distill \

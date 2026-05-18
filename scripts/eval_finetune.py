@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.abspath('./detectron2'))
 sys.path.insert(0, os.path.abspath('.'))
 
 import argparse
+import gc
 
 import torch
 import torch.nn.functional as F
@@ -101,10 +102,39 @@ def build_gsnet(config_file, weights_file, device):
     return model
 
 
+def remove_gsnet_clip_cache_hooks(gsnet):
+    """Remove GSNet's permanent CLIP skip hooks; eval uses temporary hooks."""
+    clip_model = gsnet.sem_seg_head.predictor.clip_model
+    removed = 0
+    for idx in getattr(gsnet, "layer_indexes", []):
+        block = clip_model.visual.transformer.resblocks[idx]
+        for hook_id, hook in list(block._forward_hooks.items()):
+            closure = getattr(hook, "__closure__", None) or ()
+            if any(cell.cell_contents is gsnet for cell in closure):
+                del block._forward_hooks[hook_id]
+                removed += 1
+    if hasattr(gsnet, "layers"):
+        gsnet.layers.clear()
+    if removed:
+        print(f"  Removed {removed} GSNet CLIP cache hooks.")
+
+
+def release_unused_gsnet(gsnet):
+    """Drop GSNet container references after extracting the modules eval needs."""
+    gsnet.dino_model = None
+    gsnet.backbone = None
+    gsnet.sem_seg_head = None
+    gsnet.upsample1 = None
+    gsnet.upsample2 = None
+    gsnet.dino_decod_proj1 = None
+    gsnet.dino_decod_proj2 = None
+    if hasattr(gsnet, "layers"):
+        gsnet.layers.clear()
+
+
 def load_model(gsnet_config, gsnet_weights, finetune_ckpt, device):
     print("Loading GSNet ...")
-    gsnet = build_gsnet(gsnet_config, gsnet_weights, str(device))
-    gsnet = gsnet.to(device)
+    gsnet = build_gsnet(gsnet_config, gsnet_weights, "cpu")
 
     clip_model = gsnet.sem_seg_head.predictor.clip_model
     clip_model.eval()
@@ -112,11 +142,23 @@ def load_model(gsnet_config, gsnet_weights, finetune_ckpt, device):
         p.requires_grad = False
 
     clip_skip_indices = tuple(gsnet.layer_indexes)
+    remove_gsnet_clip_cache_hooks(gsnet)
     ripd             = gsnet.sem_seg_head.predictor.transformer
     clip_upsample1   = gsnet.upsample1
     clip_upsample2   = gsnet.upsample2
     dino_decod_proj1 = gsnet.dino_decod_proj1
     dino_decod_proj2 = gsnet.dino_decod_proj2
+
+    release_unused_gsnet(gsnet)
+    del gsnet
+    gc.collect()
+
+    clip_model = clip_model.to(device)
+    ripd = ripd.to(device)
+    for module in [clip_upsample1, clip_upsample2, dino_decod_proj1, dino_decod_proj2]:
+        if module is not None:
+            module.to(device)
+    torch.cuda.empty_cache()
 
     print(f"Loading finetuned student from {finetune_ckpt} ...")
     ckpt = torch.load(finetune_ckpt, map_location=device)
