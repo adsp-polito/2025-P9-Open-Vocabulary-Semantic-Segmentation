@@ -137,6 +137,8 @@ def parse_args():
     p.add_argument("--lr",             type=float, default=1e-5)
     p.add_argument("--weight-decay",   type=float, default=1e-4)
     p.add_argument("--unfreeze-ripd",          action="store_true")
+    p.add_argument("--train-decoder-projections", action="store_true",
+                   help="Train GSNet CLIP/DINO decoder bridge projections while keeping RIPD frozen.")
     p.add_argument("--warmup-decoder-epochs",  type=int, default=0,
                    help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
     p.add_argument("--grad-accum",     type=int,   default=1,
@@ -277,6 +279,7 @@ def main():
 
     warmup        = args.warmup_decoder_epochs
     ripd_unfrozen = args.unfreeze_ripd or warmup > 0
+    decoder_proj_unfrozen = ripd_unfrozen or args.train_decoder_projections
 
     for p in ripd.parameters():
         p.requires_grad = ripd_unfrozen
@@ -286,7 +289,7 @@ def main():
                              if m is not None]
     for m in decoder_proj_modules:
         for p in m.parameters():
-            p.requires_grad = ripd_unfrozen
+            p.requires_grad = decoder_proj_unfrozen
 
     # ── Load student ─────────────────────────────────────────────────────────
     print(f"Loading student from {args.student_ckpt} ...")
@@ -309,6 +312,10 @@ def main():
         print(f"  RIPD decoder unfrozen. Student heads frozen for {warmup}-epoch warmup.")
     elif ripd_unfrozen:
         print("  RIPD unfrozen for fine-tuning.")
+    else:
+        print("  RIPD frozen; using checkpoint-loaded decoder weights.")
+    if decoder_proj_unfrozen:
+        print("  Decoder bridge projections trainable.")
 
     # ── Text features (frozen) ────────────────────────────────────────────────
     text_feats = build_text_features(args.class_json, clip_model, device)
@@ -345,11 +352,17 @@ def main():
         return [p for m in decoder_proj_modules for p in m.parameters()]
 
     if warmup > 0:
-        active_params = list(ripd.parameters()) + _decoder_proj_params()
+        active_params = []
+        if ripd_unfrozen:
+            active_params += list(ripd.parameters())
+        if decoder_proj_unfrozen:
+            active_params += _decoder_proj_params()
     else:
         active_params = _student_head_params()
         if ripd_unfrozen:
-            active_params += list(ripd.parameters()) + _decoder_proj_params()
+            active_params += list(ripd.parameters())
+        if decoder_proj_unfrozen:
+            active_params += _decoder_proj_params()
 
     optimizer  = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
     scaler     = GradScaler(enabled=args.amp)
@@ -374,7 +387,11 @@ def main():
         if warmup > 0 and epoch == warmup:
             for p in _student_head_params():
                 p.requires_grad = True
-            active_params = _student_head_params() + list(ripd.parameters()) + _decoder_proj_params()
+            active_params = _student_head_params()
+            if ripd_unfrozen:
+                active_params += list(ripd.parameters())
+            if decoder_proj_unfrozen:
+                active_params += _decoder_proj_params()
             optimizer = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
             print(f"  Epoch {epoch+1}: student heads unfrozen — joint fine-tuning begins.")
 
@@ -405,11 +422,13 @@ def main():
                         clip_model, images, _all_clip_layers)
                     l0, l1 = clip_skip_indices
                     clip_skips = {l: _all_skips[l] for l in clip_skip_indices}
-                    res4 = clip_upsample1(clip_skips[l0]) if clip_upsample1 is not None else None
-                    res5 = clip_upsample2(clip_skips[l1]) if clip_upsample2 is not None else None
                     # Build student trunk input from the same single CLIP forward
                     _stacked = torch.cat([_all_skips[l] for l in student.clip_layers], dim=1)
                     del _all_skips
+
+            with autocast(enabled=args.amp):
+                res4 = clip_upsample1(clip_skips[l0]) if clip_upsample1 is not None else None
+                res5 = clip_upsample2(clip_skips[l1]) if clip_upsample2 is not None else None
 
             # ── Student: per-branch checkpointing ────────────────────────────────
             if student.training:
@@ -551,11 +570,12 @@ def main():
             "epoch": epoch,
             "student": student.state_dict(),
             "ripd": ripd.state_dict() if ripd_unfrozen else None,
-            "clip_upsample1":   clip_upsample1.state_dict()  if ripd_unfrozen and clip_upsample1  is not None else None,
-            "clip_upsample2":   clip_upsample2.state_dict()  if ripd_unfrozen and clip_upsample2  is not None else None,
-            "dino_decod_proj1": dino_decod_proj1.state_dict() if ripd_unfrozen and dino_decod_proj1 is not None else None,
-            "dino_decod_proj2": dino_decod_proj2.state_dict() if ripd_unfrozen and dino_decod_proj2 is not None else None,
+            "clip_upsample1":   clip_upsample1.state_dict()  if decoder_proj_unfrozen and clip_upsample1  is not None else None,
+            "clip_upsample2":   clip_upsample2.state_dict()  if decoder_proj_unfrozen and clip_upsample2  is not None else None,
+            "dino_decod_proj1": dino_decod_proj1.state_dict() if decoder_proj_unfrozen and dino_decod_proj1 is not None else None,
+            "dino_decod_proj2": dino_decod_proj2.state_dict() if decoder_proj_unfrozen and dino_decod_proj2 is not None else None,
             "val_loss": avg_val,
+            "args": {**student_args, **vars(args)},
         }, os.path.join(args.output_dir, "finetune_latest.pth"))
 
         if avg_val < best_val_loss:
@@ -565,11 +585,12 @@ def main():
                 "epoch": epoch,
                 "student": student.state_dict(),
                 "ripd": ripd.state_dict() if ripd_unfrozen else None,
-                "clip_upsample1":   clip_upsample1.state_dict()  if ripd_unfrozen and clip_upsample1  is not None else None,
-                "clip_upsample2":   clip_upsample2.state_dict()  if ripd_unfrozen and clip_upsample2  is not None else None,
-                "dino_decod_proj1": dino_decod_proj1.state_dict() if ripd_unfrozen and dino_decod_proj1 is not None else None,
-                "dino_decod_proj2": dino_decod_proj2.state_dict() if ripd_unfrozen and dino_decod_proj2 is not None else None,
+                "clip_upsample1":   clip_upsample1.state_dict()  if decoder_proj_unfrozen and clip_upsample1  is not None else None,
+                "clip_upsample2":   clip_upsample2.state_dict()  if decoder_proj_unfrozen and clip_upsample2  is not None else None,
+                "dino_decod_proj1": dino_decod_proj1.state_dict() if decoder_proj_unfrozen and dino_decod_proj1 is not None else None,
+                "dino_decod_proj2": dino_decod_proj2.state_dict() if decoder_proj_unfrozen and dino_decod_proj2 is not None else None,
                 "val_loss": avg_val,
+                "args": {**student_args, **vars(args)},
             }, best_path)
             print(f"  ✓ New best val loss: {avg_val:.4f} → {best_path}")
 

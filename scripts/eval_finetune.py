@@ -134,6 +134,18 @@ def load_model(gsnet_config, gsnet_weights, finetune_ckpt, device):
     if ckpt.get("ripd") is not None:
         ripd.load_state_dict(ckpt["ripd"])
         print("  RIPD weights loaded from finetune checkpoint.")
+
+    def _load_optional_module(key, module):
+        state = ckpt.get(key)
+        if state is not None and module is not None:
+            module.load_state_dict(state)
+            print(f"  {key} weights loaded from finetune checkpoint.")
+
+    _load_optional_module("clip_upsample1", clip_upsample1)
+    _load_optional_module("clip_upsample2", clip_upsample2)
+    _load_optional_module("dino_decod_proj1", dino_decod_proj1)
+    _load_optional_module("dino_decod_proj2", dino_decod_proj2)
+
     ripd.eval()
 
     return dict(
