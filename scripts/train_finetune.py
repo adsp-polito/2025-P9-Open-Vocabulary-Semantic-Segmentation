@@ -521,6 +521,7 @@ def main():
             train_loss += loss_value
             n_train_batches += 1
             del loss, loss_value, fused_corr_embed, tf, clip_guidance, dino_L4_proj, dino_L8_proj
+            del res4, res5
             del images, labels
 
         # Validation

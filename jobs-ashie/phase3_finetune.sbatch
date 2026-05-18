@@ -66,7 +66,7 @@ nvidia-smi
     --label-dir             gs_net/data/datasets/LandDiscover_50K/GT_ID \
     --output-dir            output/ashie/finetune \
     --epochs                15 \
-    --batch-size            2 \
+    --batch-size            1 \
     --grad-accum            2 \
     --data-fraction         1.0 \
     --ripd-decoder-class-chunk-size 5 \
