@@ -206,6 +206,7 @@ def load_model(gsnet_config, gsnet_weights, finetune_ckpt, device):
         dino_decod_proj1=dino_decod_proj1,
         dino_decod_proj2=dino_decod_proj2,
         clip_skip_indices=clip_skip_indices,
+        num_classes=student_args.get("num_classes", 40),
     )
 
 
@@ -255,6 +256,16 @@ def evaluate_dataset(dataset_name, model_parts, output_dir, amp, device):
 
     text_feats = build_text_features(cfg["class_json"], model_parts["clip_model"], device)
 
+    # RIPD's ClassTransformerLayer pads fused_corr_embed (T=train_classes) by a fixed
+    # amount (pad_len - train_classes) and applies the same padding to text guidance.
+    # So text_feats must have the same T as fused_corr_embed (40) for padding to align.
+    train_classes = model_parts.get("num_classes", 40)
+    T = text_feats.size(1)
+    if T < train_classes:
+        pad = torch.zeros(1, train_classes - T, text_feats.size(2), text_feats.size(3),
+                          device=text_feats.device, dtype=text_feats.dtype)
+        text_feats = torch.cat([text_feats, pad], dim=1)
+
     eval_out = os.path.join(output_dir, dataset_name)
     os.makedirs(eval_out, exist_ok=True)
     evaluator = SemSegEvaluator(dataset_name, distributed=False, output_dir=eval_out)
@@ -291,7 +302,7 @@ def evaluate_dataset(dataset_name, model_parts, output_dir, amp, device):
                 )
             logit_up = F.interpolate(
                 logit.float(), size=(h, w), mode="bilinear", align_corners=False
-            )[0]
+            )[0, :T, ...]  # slice to actual eval classes (T may be < train_classes)
 
         evaluator.process(
             [{"file_name": entry["file_name"]}],
