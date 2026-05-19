@@ -23,6 +23,11 @@ sys.path.insert(0, os.path.abspath('.'))
 import argparse
 import gc
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -319,6 +324,9 @@ def parse_args():
     p.add_argument("--output-dir",     default="output/finetune/eval")
     p.add_argument("--amp",            action="store_true")
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--wandb-project",  default="gs-distill")
+    p.add_argument("--wandb-run",      default="eval-finetune")
+    p.add_argument("--no-wandb",       action="store_true")
     return p.parse_args()
 
 
@@ -331,7 +339,14 @@ def main():
         args.gsnet_config, args.gsnet_weights, args.finetune_ckpt, device
     )
 
-    evaluate_dataset(model_parts, args.dataset, args.output_dir, args.amp, device)
+    results = evaluate_dataset(model_parts, args.dataset, args.output_dir, args.amp, device)
+
+    if not args.no_wandb and wandb is not None:
+        wandb.init(project=args.wandb_project, name=args.wandb_run, config=vars(args))
+        wandb.log({f"{args.dataset}/{k}": v for k, v in results["sem_seg"].items()})
+        wandb.finish()
+    elif wandb is None and not args.no_wandb:
+        print("W&B not installed; skipping logging.")
 
 
 if __name__ == "__main__":

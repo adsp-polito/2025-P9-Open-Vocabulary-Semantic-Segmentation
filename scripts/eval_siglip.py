@@ -26,6 +26,11 @@ import argparse
 import gc
 import json
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -340,6 +345,9 @@ def parse_args():
     p.add_argument("--output-dir",     default="output/ashie/siglip/eval")
     p.add_argument("--amp",            action="store_true")
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--wandb-project",  default="gs-distill")
+    p.add_argument("--wandb-run",      default="eval-siglip-finetune")
+    p.add_argument("--no-wandb",       action="store_true")
     return p.parse_args()
 
 
@@ -366,6 +374,14 @@ def main():
         miou = res["sem_seg"].get("mIoU", float("nan"))
         print(f"  {ds:<20} mIoU = {miou:.4f}")
     print(f"{'='*60}")
+
+    if not args.no_wandb and wandb is not None:
+        wandb.init(project=args.wandb_project, name=args.wandb_run, config=vars(args))
+        for ds, res in all_results.items():
+            wandb.log({f"{ds}/{k}": v for k, v in res["sem_seg"].items()})
+        wandb.finish()
+    elif wandb is None and not args.no_wandb:
+        print("W&B not installed; skipping logging.")
 
 
 if __name__ == "__main__":
