@@ -178,7 +178,7 @@ def load_model(gsnet_config, gsnet_weights, finetune_ckpt, device):
         num_classes=student_args.get("num_classes", 40),
         clip_layers=student_args.get("clip_layers", [4, 8, 10, 12]),
     ).to(device)
-    student.load_state_dict(ckpt["student"])
+    student.load_state_dict(ckpt["student"], strict=False)
     student.eval()
 
     if ckpt.get("ripd") is not None:
