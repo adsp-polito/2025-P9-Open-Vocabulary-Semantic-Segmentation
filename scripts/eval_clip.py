@@ -146,8 +146,11 @@ def release_unused_gsnet(gsnet):
 
 
 def load_model(gsnet_config, gsnet_weights, finetune_ckpt, device):
-    print("Loading GSNet ...")
+    import time
+    t0 = time.time()
+    print("Loading GSNet (CLIP + RIPD + DINOv3) ...")
     gsnet = build_gsnet(gsnet_config, gsnet_weights, "cpu")
+    print(f"  GSNet loaded in {time.time()-t0:.1f}s")
 
     clip_model = gsnet.sem_seg_head.predictor.clip_model
     clip_model.eval()
@@ -162,18 +165,21 @@ def load_model(gsnet_config, gsnet_weights, finetune_ckpt, device):
     dino_decod_proj1   = gsnet.dino_decod_proj1
     dino_decod_proj2   = gsnet.dino_decod_proj2
 
+    print("  Releasing DINOv3 ...")
     release_unused_gsnet(gsnet)
     del gsnet
     gc.collect()
 
+    print("  Moving modules to device ...")
     clip_model = clip_model.to(device)
     ripd = ripd.to(device)
     for module in [clip_upsample1, clip_upsample2, dino_decod_proj1, dino_decod_proj2]:
         if module is not None:
             module.to(device)
     torch.cuda.empty_cache()
+    print(f"  Modules on device. ({time.time()-t0:.1f}s total)")
 
-    print(f"Loading finetuned student from {finetune_ckpt} ...")
+    print(f"Loading finetuned student from {finetune_ckpt} ...", flush=True)
     ckpt = torch.load(finetune_ckpt, map_location=device)
     student_args = ckpt.get("args", {})
     student = GSDistillStudent(
@@ -185,6 +191,7 @@ def load_model(gsnet_config, gsnet_weights, finetune_ckpt, device):
     ).to(device)
     student.load_state_dict(ckpt["student"], strict=False)
     student.eval()
+    print(f"  Student loaded. (epoch {ckpt.get('epoch', '?')}, val_loss {ckpt.get('val_loss', float('nan')):.4f})", flush=True)
 
     if ckpt.get("ripd") is not None:
         ripd.load_state_dict(ckpt["ripd"])
@@ -346,6 +353,10 @@ def parse_args():
 
 
 def main():
+    import sys
+    # Force line-buffered stdout so logs appear immediately in SLURM .out files
+    sys.stdout.reconfigure(line_buffering=True)
+
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device)
