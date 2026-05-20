@@ -1,20 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=finetune
+#SBATCH --job-name=clip_distill_ft
 #SBATCH --account=intrn
 #SBATCH --partition=RTX
 #SBATCH --qos=preemptable
 #SBATCH --gres=gpu:2080ti:1
 #SBATCH --mem=32G
-#SBATCH --time=2-00:00:00
-#SBATCH --output=jobs-ashie/logs/finetune_%j.out
-#SBATCH --error=jobs-ashie/logs/finetune_%j.err
+#SBATCH --time=3-00:00:00
+#SBATCH --output=jobs-ashie/logs/clip_distill_ft_%j.out
+#SBATCH --error=jobs-ashie/logs/clip_distill_ft_%j.err
 
 set -euo pipefail
 
 PROJECT_ROOT="/nfs/home/hassan/2025-P9-Open-Vocabulary-Semantic-Segmentation"
 PYTHON="/nfs/home/hassan/miniconda3/envs/gsnet/bin/python3"
 cd "${PROJECT_ROOT}"
-mkdir -p jobs-ashie/logs output/ashie/finetune
+mkdir -p jobs-ashie/logs output/ashie/clip
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate gsnet
@@ -30,7 +30,6 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
 fi
 
 GSNET_WEIGHTS="output/gsnet_pretrain/model_final.pth"
-STUDENT_CKPT="output/distill/student_best.pth"
 
 if [[ ! -f "${GSNET_WEIGHTS}" ]]; then
     echo "[ERROR] GSNet checkpoint not found: ${GSNET_WEIGHTS}"
@@ -38,19 +37,13 @@ if [[ ! -f "${GSNET_WEIGHTS}" ]]; then
     exit 1
 fi
 
-if [[ ! -f "${STUDENT_CKPT}" ]]; then
-    echo "[ERROR] Student checkpoint not found: ${STUDENT_CKPT}"
-    echo "        Run phase2_distill_online.sbatch first."
-    exit 1
-fi
-
 echo "============================================================"
-echo "Phase 3 — GS-Distill fine-tuning on LD50K (ViT-L/14@336px)"
-echo "  GSNet:    ${GSNET_WEIGHTS}"
-echo "  Student:  ${STUDENT_CKPT}"
-echo "  Images:   gs_net/data/datasets/LandDiscover_50K/TR_Image"
-echo "  Labels:   gs_net/data/datasets/LandDiscover_50K/GT_ID"
-echo "  Output:   output/ashie/finetune"
+echo "CLIP — Phase 2 (distill) + Phase 3 (finetune) on LD50K"
+echo "  Backbone:  OpenAI CLIP ViT-L/14@336px (from GSNet checkpoint)"
+echo "  GSNet:     ${GSNET_WEIGHTS}"
+echo "  Images:    gs_net/data/datasets/LandDiscover_50K/TR_Image"
+echo "  Labels:    gs_net/data/datasets/LandDiscover_50K/GT_ID"
+echo "  Output:    output/ashie/clip"
 echo "============================================================"
 echo "Job ID: ${SLURM_JOB_ID:-N/A}   Node: ${SLURM_NODELIST:-N/A}"
 echo "Start:  $(date)"
@@ -58,28 +51,27 @@ echo "============================================================"
 
 nvidia-smi
 
-"${PYTHON}" scripts/train_finetune.py \
+"${PYTHON}" scripts/train_clip.py \
     --gsnet-config          configs/vitl_336_dinov3.yaml \
     --gsnet-weights         "${GSNET_WEIGHTS}" \
-    --student-ckpt          "${STUDENT_CKPT}" \
     --image-dir             gs_net/data/datasets/LandDiscover_50K/TR_Image \
     --label-dir             gs_net/data/datasets/LandDiscover_50K/GT_ID \
-    --output-dir            output/ashie/finetune \
-    --epochs                15 \
+    --output-dir            output/ashie/clip \
+    --distill-epochs        30 \
+    --finetune-epochs       15 \
     --batch-size            1 \
     --grad-accum            2 \
-    --data-fraction         1.0 \
-    --ripd-decoder-class-chunk-size 5 \
-    --ripd-agg-layers       2 \
+    --clip-layers           8 16 20 23 \
     --lr                    1e-5 \
-    --warmup-decoder-epochs 0 \
     --num-workers           2 \
     --amp \
     --wandb-project         gs-distill \
-    --wandb-run             finetune-vitl336-run1
+    --wandb-run             clip-vitl336-run1
 
 echo ""
 echo "============================================================"
-echo "Phase 3 done. Best checkpoint: output/ashie/finetune/finetune_best.pth"
+echo "CLIP job done."
+echo "  Distill best:  output/ashie/clip/student_distill_best.pth"
+echo "  Finetune best: output/ashie/clip/finetune_best.pth"
 echo "End: $(date)"
 echo "============================================================"

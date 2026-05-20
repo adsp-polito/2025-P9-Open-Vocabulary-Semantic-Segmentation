@@ -170,10 +170,8 @@ def load_model(gsnet_config, gsnet_weights, finetune_ckpt, device):
     student_args = ckpt.get("args", {})
     student = GSDistillStudent(
         clip_model=clip_model,
-        hidden_dim=student_args.get("hidden_dim", 128),
         d_dino=student_args.get("d_dino", 768),
-        num_classes=student_args.get("num_classes", 40),
-        clip_layers=student_args.get("clip_layers", [4, 8, 10, 12]),
+        clip_layers=student_args.get("clip_layers", [8, 16, 20, 23]),
     ).to(device)
     student.load_state_dict(ckpt["student"])
     student.eval()

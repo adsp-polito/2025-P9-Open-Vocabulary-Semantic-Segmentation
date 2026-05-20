@@ -1,19 +1,37 @@
 ---
 name: GS-Distill project overview
-description: What GS-Distill is doing — knowledge distillation pipeline for open-vocabulary semantic segmentation to replace expensive DINOv3 backbone with a lightweight student
+description: Dynamic GS-Distill pipeline for open-vocabulary semantic segmentation
 type: project
 ---
 
-GS-Distill is a 4-phase knowledge distillation pipeline that replaces the expensive DINOv3 (RSIB) backbone in GSNet with a lightweight student conv head, while preserving the RIPD decoder unchanged.
+GS-Distill replaces GSNet's expensive DINOv3 image stream with a lightweight student while
+leaving GSNet/RIPD's normal dynamic text-conditioned fusion path intact.
 
-**Teacher model (GSNet)** fuses CLIP ViT-B/16 + DINOv3 features through QGFF inside RIPD to produce `fused_corr_embed`, plus DINOv3 skip features (layers 4 and 8) used in the decoder.
+The active student does not predict fixed LD50K class slots. It predicts only text-independent
+DINO substitute tensors:
 
-**Phase 1 — cache_teacher.py**: Runs frozen GSNet on all LD50K images, captures three tensors per image via monkey-patching: `fused_corr_embed` (hidden_dim × T × 24 × 24), `dino_L4` (768 × 48 × 48), `dino_L8` (768 × 48 × 48). Saves as `.pt` files.
+- `dino_down`: `(B, 768, 24, 24)` for RIPD's DINO correlation branch.
+- `dino_L4`: `(B, 768, 48, 48)` for DINO decoder guidance.
+- `dino_L8`: `(B, 768, 48, 48)` for DINO decoder guidance.
 
-**Phase 3 — train_distill.py**: Trains `GSDistillStudent` (gs_distill/student.py) to predict those three tensors from frozen CLIP multi-layer features only (layers 4, 8, 10, 12 → 4×768 → shared trunk → three branches). Loss = per-branch MSE + (1 − cosine_sim). No segmentation labels needed.
+At inference/fine-tune time, the pipeline calls normal `ripd(...)` with image features,
+student-predicted DINO substitutes, decoder guidance, and the active dataset text features.
+RIPD computes CLIP/DINO correlation, fusion, aggregation, and decoding dynamically, so logits
+naturally have `T = len(current_dataset_classes)`.
 
-**Phase 4 — train_finetune.py** (optional): End-to-end fine-tune of student + frozen RIPD on LD50K with cross-entropy segmentation labels. Inference path (gs_distill/inference.py): student predicts `fused_corr_embed` + DINOv3 features → fed into `ripd.forward_from_fusion()`, bypassing QGFF/RSIB entirely.
+Active training entry points:
 
-**Why:** DINOv3 is expensive; CLIP is already being computed by the full model. Student learns to predict DINOv3's outputs from CLIP features that are already available, so inference cost drops significantly.
+- `scripts/train_clip.py`: CLIP ViT-L dynamic distill + LD50K fine-tune.
+- `scripts/train_baseline.py`: CLIP dynamic architecture from random student init.
+- `scripts/train_siglip.py`: SigLIP image-backbone variant using the same dynamic RIPD path.
+- `scripts/train_tips.py`: TIPSv2 image-backbone variant using the same dynamic RIPD path.
 
-**Dataset:** LD50K = LandDiscover50K, a remote sensing segmentation dataset with 40 classes.
+Removed legacy pieces:
+
+- `scripts/ripd_lite.py`
+- old two-script distill/fine-tune SLURM jobs
+- fixed 40-slot class padding/slicing in CLIP eval
+- cached fixed-fusion dataset helper
+
+Do not touch the real RIPD implementation in `gs_net/modeling/transformer/RIPD.py` for this
+cleanup. Its internal dynamic correlation variable names are part of GSNet itself.

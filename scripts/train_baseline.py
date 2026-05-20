@@ -1,7 +1,7 @@
 """
 Baseline — same architecture as GS-Distill but NO distillation pre-training.
 
-Builds a GSDistillStudent (identical shared trunk + 4 heads) with randomly
+Builds a GSDistillStudent (identical shared trunk + DINO substitute heads) with randomly
 initialised weights, then fine-tunes directly on LD50K segmentation labels.
 
 This is the apples-to-apples benchmark for GS-Distill: same model, same
@@ -20,8 +20,6 @@ Usage:
         [--epochs 15] \\
         [--batch-size 1] \\
         [--lr 1e-5] \\
-        [--ripd-decoder-class-chunk-size 5] \\
-        [--ripd-agg-layers 2] \\
         [--amp] \\
         [--device cuda]
 """
@@ -59,11 +57,10 @@ from gs_distill.inference import gs_distill_inference
 from gs_distill.student import GSDistillStudent
 from gs_distill.utils import get_clip_skips
 from einops import rearrange as _rearrange
-from ripd_lite import log_cuda_memory, patch_ripd, reset_cuda_memory_peak
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Segmentation dataset  (identical to train_finetune.py)
+# Segmentation dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SegDataset(Dataset):
@@ -128,10 +125,8 @@ def parse_args():
     p.add_argument("--batch-size",     type=int,   default=1)
     p.add_argument("--lr",             type=float, default=1e-5)
     p.add_argument("--weight-decay",   type=float, default=1e-4)
-    p.add_argument("--hidden-dim",     type=int,   default=128)
     p.add_argument("--d-dino",         type=int,   default=768)
-    p.add_argument("--num-classes",    type=int,   default=40)
-    p.add_argument("--clip-layers",    type=int,   nargs="+", default=[4, 8, 10, 12])
+    p.add_argument("--clip-layers",    type=int,   nargs="+", default=[8, 16, 20, 23])
     p.add_argument("--unfreeze-ripd",          action="store_true")
     p.add_argument("--train-decoder-projections", action="store_true",
                    help="Train GSNet CLIP/DINO decoder bridge projections while keeping RIPD frozen.")
@@ -139,12 +134,6 @@ def parse_args():
                    help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
     p.add_argument("--grad-accum",     type=int,   default=1,
                    help="Gradient accumulation steps (effective batch = batch-size * grad-accum).")
-    p.add_argument("--ripd-decoder-class-chunk-size", type=int, default=5,
-                   help="Stream RIPD decoder tail over class chunks; 0 disables.")
-    p.add_argument("--ripd-memory-logging", action="store_true",
-                   help="Print detailed CUDA memory checkpoints around RIPD forward/backward.")
-    p.add_argument("--ripd-agg-layers", type=int, default=0,
-                   help="Use only the first N RIPD AggregatorLayers; 0 keeps all.")
     p.add_argument("--amp",            action="store_true")
     p.add_argument("--num-workers",    type=int,   default=4)
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
@@ -278,7 +267,6 @@ def main():
     remove_gsnet_clip_cache_hooks(gsnet)
 
     ripd             = gsnet.sem_seg_head.predictor.transformer
-    patch_ripd(ripd, args)
     clip_upsample1   = gsnet.upsample1
     clip_upsample2   = gsnet.upsample2
     dino_decod_proj1 = gsnet.dino_decod_proj1
@@ -313,12 +301,9 @@ def main():
     print("Building baseline student (random init, same arch as GS-Distill) ...")
     student = GSDistillStudent(
         clip_model=clip_model,
-        hidden_dim=args.hidden_dim,
         d_dino=args.d_dino,
-        num_classes=args.num_classes,
         clip_layers=args.clip_layers,
     ).to(device)
-    student.clip_embed_branch = None  # distillation-only branch; not needed for inference
 
     n_params = sum(p.numel() for p in student.trainable_parameters())
     print(f"  Trainable params: {n_params / 1e6:.2f}M")
@@ -357,7 +342,7 @@ def main():
     def _student_head_params():
         return (
             list(student.shared_trunk.parameters())
-            + list(student.fusion_branch.parameters())
+            + list(student.dino_down_branch.parameters())
             + list(student.dino_l4_branch.parameters())
             + list(student.dino_l8_branch.parameters())
         )
@@ -444,12 +429,10 @@ def main():
                     _trunk = grad_ckpt.checkpoint(student.shared_trunk, _stacked, use_reentrant=False)
                 del _stacked
 
-                def _fuse(_x):
+                def _down(_x):
                     with autocast(enabled=args.amp):
-                        return _rearrange(student.fusion_branch(_x),
-                                          "B (C T) H W -> B C T H W",
-                                          C=student.hidden_dim, T=student.num_classes)
-                fused_corr_embed = grad_ckpt.checkpoint(_fuse, _trunk, use_reentrant=False)
+                        return student.dino_down_branch(_x)
+                dino_down = grad_ckpt.checkpoint(_down, _trunk, use_reentrant=False)
 
                 def _dl4(_x):
                     with autocast(enabled=args.amp):
@@ -465,9 +448,7 @@ def main():
                 with torch.no_grad(), autocast(enabled=args.amp):
                     _trunk = student.shared_trunk(_stacked)
                     del _stacked
-                    fused_corr_embed = _rearrange(student.fusion_branch(_trunk),
-                                                  "B (C T) H W -> B C T H W",
-                                                  C=student.hidden_dim, T=student.num_classes)
+                    dino_down = student.dino_down_branch(_trunk)
                     _dino_L4 = student.dino_l4_branch(_trunk) if dino_decod_proj1 is not None else None
                     _dino_L8 = student.dino_l8_branch(_trunk) if dino_decod_proj2 is not None else None
                     del _trunk
@@ -477,18 +458,16 @@ def main():
                 dino_L8_proj = dino_decod_proj2(_dino_L8) if _dino_L8 is not None else None
             del _dino_L4, _dino_L8
 
-            clip_guidance = {
-                "res3": _rearrange(clip_features[:, 1:, :], "B (H W) C -> B C H W", H=24),
-                "res4": res4,
-                "res5": res5,
-            }
+            clip_res3 = _rearrange(clip_features[:, 1:, :], "B (H W) C -> B C H W", H=24)
+            clip_guidance = (clip_res3, res4, res5)
             del clip_features, clip_skips
 
-            logit = ripd.forward_from_fusion(
-                fused_corr_embed=fused_corr_embed,
-                text_feats=tf,
-                appearance_guidance=clip_guidance,
-                dino_guidance=[dino_L4_proj, dino_L8_proj],
+            logit = ripd(
+                clip_res3,
+                dino_down,
+                tf,
+                clip_guidance,
+                [dino_L4_proj, dino_L8_proj],
             )
 
             with autocast(enabled=args.amp):
@@ -499,18 +478,13 @@ def main():
                 del logit_up
             loss_value = loss.detach().item() * grad_accum
 
-            if args.ripd_memory_logging:
-                reset_cuda_memory_peak()
             try:
                 if args.amp:
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
             except RuntimeError:
-                log_cuda_memory("after backward failed", reset_peak=False)
                 raise
-            if args.ripd_memory_logging:
-                log_cuda_memory("after backward")
 
             is_last_step = (step + 1 == len(train_loader))
             if (step + 1) % grad_accum == 0 or is_last_step:
@@ -526,7 +500,7 @@ def main():
 
             train_loss += loss_value
             n_train_batches += 1
-            del loss, loss_value, fused_corr_embed, tf, clip_guidance, dino_L4_proj, dino_L8_proj
+            del loss, loss_value, dino_down, tf, clip_res3, clip_guidance, dino_L4_proj, dino_L8_proj
             del res4, res5
             del images, labels
 

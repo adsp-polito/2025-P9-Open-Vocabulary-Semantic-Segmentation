@@ -1,20 +1,7 @@
 """
-TIPSv2 backbone — combined Phase 2 (online distillation) + Phase 3 (segmentation fine-tune).
+CLIP backbone — combined Phase 2 (online distillation) + Phase 3 (segmentation fine-tune).
 
-Replaces the OpenAI CLIP image backbone with google/tipsv2-b14
-(HuggingFace, trust_remote_code=True). The student predicts text-independent
-DINO substitutes and normal RIPD computes dynamic text-conditioned correlations.
-
-Key differences from the CLIP pipeline:
-  - TIPSv2 loaded via AutoModel with trust_remote_code=True
-  - Layer path: model.vision_encoder.blocks[l]  (NOT vision_model.encoder.layers)
-  - Hook output: (B, seq_len, C) — seq = [CLS, register, patch×1024]; patch tokens start at index 2
-  - Image normalisation: mean=0.5, std=0.5  (same as SigLIP)
-  - Text features: model.encode_text(list_of_strings) — takes raw strings, no tokenizer call
-  - config.hidden_size at top level (not nested under vision_config)
-  - Resolution: 448×448, patch 14 → 32×32 = 1024 patch tokens
-  - GSNet teacher still uses original CLIP — loaded from the GSNet checkpoint as usual
-  - No Phase 1 attention fine-tuning required for TIPSv2
+Runs online DINO-substitute distillation and LD50K segmentation fine-tuning in one script.
 
 Phase 2 (distillation) completes first, saves student_distill_best.pth, then
 Phase 3 (fine-tune) starts automatically from that checkpoint.
@@ -22,12 +9,12 @@ Phase 3 (fine-tune) starts automatically from that checkpoint.
 Usage:
     export RSIB_CKPT='path/to/dinov3.pth'
 
-    python scripts/train_tips.py \\
-        --gsnet-config  configs/vitb_384.yaml \\
+    python scripts/train_clip.py \\
+        --gsnet-config  configs/vitl_336_dinov3.yaml \\
         --gsnet-weights path/to/gsnet.pth \\
         --image-dir     path/to/LD50K/TR_Image \\
         --label-dir     path/to/LD50K/TR_Label \\
-        --output-dir    output/ashie/tips \\
+        --output-dir    output/ashie/clip \\
         [--distill-epochs 30] [--finetune-epochs 15] \\
         [--batch-size 4] [--lr 1e-5] [--amp] [--wandb-project gs-distill]
 """
@@ -56,15 +43,16 @@ from einops import rearrange
 from tqdm import tqdm
 
 import wandb
-from transformers import AutoModel
 
 from detectron2.config import get_cfg
 from detectron2.checkpoint import DetectionCheckpointer
-
 from gs_net import add_cat_seg_config
 import gs_net  # noqa: side-effect registrations
 
+from gs_distill.student import GSDistillStudent
 from gs_distill.losses import distillation_loss_per_branch
+from gs_distill.inference import gs_distill_inference
+from gs_distill.utils import get_clip_skips
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,268 +71,50 @@ CLASSES_LandDiscover50K = [
     'vehicle', 'windmill',
 ]
 
-# TIPSv2 uses the same normalisation as SigLIP
-_TIPS_MEAN = torch.tensor([0.5, 0.5, 0.5])
-_TIPS_STD  = torch.tensor([0.5, 0.5, 0.5])
-
-# TIPSv2-B14 @ 448px: 12 transformer layers (0–11), 32×32 = 1024 patch tokens.
-# Mirror CLIP [4, 8, 10, 12] depth-wise → [4, 8, 10, 11] (max index = 11).
-TIPS_LAYERS_DEFAULT = [4, 8, 10, 11]
-TRUNK_OUT = 512
-
-# Tokens before patch tokens in the TIPSv2 sequence: [CLS(1) + register(1)]
-_TIPS_PREFIX_TOKENS = 2
+_CLIP_MEAN = torch.tensor([0.48145466, 0.4578275,  0.40821073])
+_CLIP_STD  = torch.tensor([0.26862954, 0.26130258, 0.27577711])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TIPSv2 feature extraction helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _tips_native_res(tips_model) -> int:
-    return tips_model.config.img_size
-
-
-def extract_tips_layers(tips_model, image: torch.Tensor, layers: list) -> torch.Tensor:
-    """
-    Extract intermediate patch features from a TIPSv2 ViT for specified block indices.
-
-    TIPSv2 sequence layout: [CLS(0), register(1), patch_0 … patch_1023]
-    Patch tokens start at index _TIPS_PREFIX_TOKENS (2), not 1 like CLIP/SigLIP.
-
-    Hook output shape: (B, seq_len, C) where seq_len = 1026 for B14@448px.
-
-    Args:
-        tips_model: frozen TIPSv2 model (google/tipsv2-b14).
-        image: (B, 3, H, W) TIPSv2-normalised, any spatial size.
-        layers: list of vision_encoder.blocks indices, e.g. [4, 8, 10, 11].
-
-    Returns:
-        (B, len(layers)*C, H_grid, W_grid) stacked spatial patch features.
-    """
-    native_res = _tips_native_res(tips_model)
-    if image.shape[-2] != native_res or image.shape[-1] != native_res:
-        image = F.interpolate(image, size=(native_res, native_res),
-                              mode="bilinear", align_corners=False)
-
-    captured = {}
-    hooks = []
-    for l in layers:
-        def make_hook(idx):
-            def hook(module, input, output):
-                # output: (B, seq_len, C)
-                captured[idx] = output
-            return hook
-        h = tips_model.vision_encoder.blocks[l].register_forward_hook(make_hook(l))
-        hooks.append(h)
-
-    with torch.no_grad():
-        # Return value is (cls, register, patches) tuple — discarded here, hooks capture what we need
-        tips_model.vision_encoder(image)
-
-    for h in hooks:
-        h.remove()
-
-    feature_maps = []
-    for l in layers:
-        feat = captured[l]                          # (B, seq_len, C)
-        feat = feat[:, _TIPS_PREFIX_TOKENS:, :]     # drop CLS + register → (B, n_patches, C)
-        B, n, C = feat.shape
-        H = W = int(n ** 0.5)
-        feat = rearrange(feat, "B (H W) C -> B C H W", H=H, W=W)
-        if H != 24 or W != 24:
-            feat = F.interpolate(feat, size=(24, 24), mode="bilinear", align_corners=False)
-        feature_maps.append(feat)
-
-    return torch.cat(feature_maps, dim=1)   # (B, len(layers)*C, H_grid, W_grid)
-
-
-def get_tips_skips(tips_model, image: torch.Tensor, layer_indices: list):
-    """
-    Return patch feature maps at given block indices and the full last hidden state.
-    Mirrors get_clip_skips() / get_siglip_skips() for use in siglip_inference equivalent.
-
-    Returns:
-        res3: (B, C, 24, 24) last-layer patch map resized for RIPD guidance.
-        skips: dict mapping layer_index -> (B, C, H_grid, W_grid)
-    """
-    native_res = _tips_native_res(tips_model)
-    if image.shape[-2] != native_res or image.shape[-1] != native_res:
-        image = F.interpolate(image, size=(native_res, native_res),
-                              mode="bilinear", align_corners=False)
-
-    captured = {}
-    hooks = []
-    for l in layer_indices:
-        def make_hook(idx):
-            def hook(module, input, output):
-                captured[idx] = output   # (B, seq_len, C)
-            return hook
-        h = tips_model.vision_encoder.blocks[l].register_forward_hook(make_hook(l))
-        hooks.append(h)
-
-    with torch.no_grad():
-        # vision_encoder returns (cls_token, register_tokens, patch_tokens) in non-training mode
-        _, _, patch_tokens = tips_model.vision_encoder(image)
-
-    for h in hooks:
-        h.remove()
-
-    skips = {}
-    for l in layer_indices:
-        feat = captured[l][:, _TIPS_PREFIX_TOKENS:, :]   # drop CLS + register → (B, n_patches, C)
-        B, n, C = feat.shape
-        H = W = int(n ** 0.5)
-        feat = rearrange(feat, "B (H W) C -> B C H W", H=H, W=W)
-        if H != 24 or W != 24:
-            feat = F.interpolate(feat, size=(24, 24), mode="bilinear", align_corners=False)
-        skips[l] = feat
-
-    # patch_tokens: (B, 1024, C) — used directly for res3 guidance
-    B, n, C = patch_tokens.shape
-    H = W = int(n ** 0.5)
-    res3 = rearrange(patch_tokens, "B (H W) C -> B C H W", H=H, W=W)
-    if H != 24 or W != 24:
-        res3 = F.interpolate(res3, size=(24, 24), mode="bilinear", align_corners=False)
-    return res3, skips
-
-
-def tips_normalise(images: torch.Tensor) -> torch.Tensor:
-    """(B, 3, H, W) in [0, 1] → TIPSv2-normalised."""
-    mean = _TIPS_MEAN.to(images.device).view(1, 3, 1, 1)
-    std  = _TIPS_STD.to(images.device).view(1, 3, 1, 1)
+def clip_normalise(images: torch.Tensor) -> torch.Tensor:
+    """(B, 3, H, W) in [0, 1] → CLIP-normalised."""
+    mean = _CLIP_MEAN.to(images.device).view(1, 3, 1, 1)
+    std  = _CLIP_STD.to(images.device).view(1, 3, 1, 1)
     return (images - mean) / std
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TIPSv2 student — identical architecture to GSDistillStudent, TIPS backbone
+# Teacher capture state (written by patches, read by training loop)
 # ─────────────────────────────────────────────────────────────────────────────
-
-class TIPSStudent(nn.Module):
-    """
-    GS-Distill student with a frozen TIPSv2 image backbone.
-
-    Predicts text-independent DINO substitutes and optional decoder skip
-    adapters. RIPD remains responsible for dynamic text-conditioned fusion.
-      - Frozen TIPSv2 ViT (multi-layer features)
-      - Shared conv trunk (len(layers)*C → 512 channels)
-      - DINO-L4 head: predicts dino_L4           (B, d_dino, 2H, 2W)
-      - DINO-L8 head: predicts dino_L8           (B, d_dino, 2H, 2W)
-    """
-
-    def __init__(self, tips_model: nn.Module, d_dino: int = 768,
-                 tips_layers: list = None, clip_skip_dims=None):
-        super().__init__()
-
-        self.tips_model = tips_model
-        for p in self.tips_model.parameters():
-            p.requires_grad = False
-
-        self.tips_layers  = tips_layers if tips_layers is not None else TIPS_LAYERS_DEFAULT
-        self.d_dino       = d_dino
-
-        # embed_dim is top-level in TIPSv2 config (768 for B14)
-        clip_dim  = tips_model.config.embed_dim
-        trunk_in  = len(self.tips_layers) * clip_dim
-        clip_skip_dims = clip_skip_dims or (clip_dim, clip_dim)
-
-        self.shared_trunk = nn.Sequential(
-            nn.Conv2d(trunk_in, TRUNK_OUT, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(TRUNK_OUT, TRUNK_OUT, kernel_size=3, padding=1),
-            nn.GELU(),
-        )
-
-        self.dino_down_branch = nn.Sequential(
-            nn.Conv2d(TRUNK_OUT, d_dino, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(d_dino, d_dino, kernel_size=3, padding=1),
-        )
-        self.dino_l4_branch = nn.Sequential(
-            nn.ConvTranspose2d(TRUNK_OUT, d_dino, kernel_size=2, stride=2),
-            nn.GELU(),
-            nn.Conv2d(d_dino, d_dino, kernel_size=3, padding=1),
-        )
-        self.dino_l8_branch = nn.Sequential(
-            nn.ConvTranspose2d(TRUNK_OUT, d_dino, kernel_size=2, stride=2),
-            nn.GELU(),
-            nn.Conv2d(d_dino, d_dino, kernel_size=3, padding=1),
-        )
-        self.clip_skip_adapters = nn.ModuleList([
-            nn.Identity() if target_dim == clip_dim else nn.Conv2d(clip_dim, target_dim, kernel_size=1)
-            for target_dim in clip_skip_dims
-        ])
-        for adapter in self.clip_skip_adapters:
-            if isinstance(adapter, nn.Conv2d):
-                nn.init.zeros_(adapter.weight)
-                if adapter.bias is not None:
-                    nn.init.zeros_(adapter.bias)
-                n = min(adapter.out_channels, adapter.in_channels)
-                with torch.no_grad():
-                    for i in range(n):
-                        adapter.weight[i, i, 0, 0] = 1.0
-
-    def forward(self, image: torch.Tensor) -> dict:
-        with torch.no_grad():
-            stacked = extract_tips_layers(self.tips_model, image, self.tips_layers)
-
-        trunk_out = self.shared_trunk(stacked)   # (B, 512, H_grid, W_grid)
-
-        return {
-            "dino_down": self.dino_down_branch(trunk_out),
-            "dino_L4": self.dino_l4_branch(trunk_out),
-            "dino_L8": self.dino_l8_branch(trunk_out),
-        }
-
-    def adapt_clip_skip(self, skip: torch.Tensor, index: int) -> torch.Tensor:
-        return self.clip_skip_adapters[index](skip)
-
-    def trainable_parameters(self):
-        params = (
-            list(self.shared_trunk.parameters())
-            + list(self.dino_down_branch.parameters())
-            + list(self.dino_l4_branch.parameters())
-            + list(self.dino_l8_branch.parameters())
-            + list(self.clip_skip_adapters.parameters())
-        )
-        return params
+_dino_last  = [None]
+_dino_l4    = [None]
+_dino_l8    = [None]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TIPSv2 inference — replaces gs_distill_inference for this backbone
+# Teacher DINO capture patch
 # ─────────────────────────────────────────────────────────────────────────────
 
-def tips_inference(
-    image, text_feats, student, tips_model,
-    ripd, clip_upsample1, clip_upsample2,
-    dino_decod_proj1, dino_decod_proj2,
-    skip_layer_indices=(3, 7),
-):
-    """
-    Full inference using TIPSv2 features instead of CLIP.
-    Mirrors siglip_inference() but uses get_tips_skips().
+def _patch_dino(dino_model):
+    original_fn = dino_model.get_intermediate_layers
 
-    res3 guidance is resized to RIPD's 24x24 feature grid.
-    """
-    with torch.no_grad():
-        res3, skips = get_tips_skips(tips_model, image, list(skip_layer_indices))
-        l0, l1 = skip_layer_indices
+    def patched_fn(imgs, n=12):
+        result = original_fn(imgs, n)
+        _dino_last[0] = rearrange(
+            result[-1][:, 1:, :], "B (H W) C -> B C H W", H=48
+        ).detach().cpu().half()
+        _dino_l4[0] = rearrange(
+            result[3][:, 1:, :], "B (H W) C -> B C H W", H=48
+        ).detach().cpu().half()
+        _dino_l8[0] = rearrange(
+            result[7][:, 1:, :], "B (H W) C -> B C H W", H=48
+        ).detach().cpu().half()
+        return result
 
-    student_out = student(image)
-    predicted_dino_down = student_out["dino_down"]
-    predicted_dino_L4 = student_out["dino_L4"]
-    predicted_dino_L8 = student_out["dino_L8"]
+    dino_model.get_intermediate_layers = patched_fn
 
-    res4_raw = student.adapt_clip_skip(skips[l0], 0) if clip_upsample1 is not None else None
-    res5_raw = student.adapt_clip_skip(skips[l1], 1) if clip_upsample2 is not None else None
-    res4 = clip_upsample1(res4_raw) if res4_raw is not None else None
-    res5 = clip_upsample2(res5_raw) if res5_raw is not None else None
-    dino_L4_proj = dino_decod_proj1(predicted_dino_L4) if dino_decod_proj1 is not None else None
-    dino_L8_proj = dino_decod_proj2(predicted_dino_L8) if dino_decod_proj2 is not None else None
-    clip_guidance = (res3, res4, res5)
-    dino_guidance = [dino_L4_proj, dino_L8_proj]
-
-    logit = ripd(res3, predicted_dino_down, text_feats, clip_guidance, dino_guidance)
-    return logit
+    def unpatch():
+        dino_model.get_intermediate_layers = original_fn
+    return unpatch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,7 +125,7 @@ class ImageDataset(Dataset):
     """Image-only dataset for Phase 2 distillation (no labels)."""
     EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
-    def __init__(self, image_dir, resolution=448):
+    def __init__(self, image_dir, resolution=384):
         self.resolution = resolution
         self.paths = sorted(
             p for p in Path(image_dir).rglob("*")
@@ -377,7 +147,7 @@ class SegDataset(Dataset):
     """Image + label dataset for Phase 3 segmentation fine-tuning."""
     EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
-    def __init__(self, image_dir, label_dir, resolution=448):
+    def __init__(self, image_dir, label_dir, resolution=384):
         self.resolution = resolution
 
         img_stems = {
@@ -410,7 +180,8 @@ class SegDataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         img = TF.resize(img, (self.resolution, self.resolution))
         img = TF.to_tensor(img)
-        img = TF.normalize(img, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        img = TF.normalize(img, mean=[0.48145466, 0.4578275, 0.40821073],
+                           std=[0.26862954, 0.26130258, 0.27577711])
 
         lbl = Image.open(lbl_path)
         lbl = TF.resize(lbl, (self.resolution, self.resolution),
@@ -422,34 +193,6 @@ class SegDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 # Teacher setup
 # ─────────────────────────────────────────────────────────────────────────────
-
-_dino_last  = [None]
-_dino_l4    = [None]
-_dino_l8    = [None]
-
-
-def _patch_dino(dino_model):
-    original_fn = dino_model.get_intermediate_layers
-
-    def patched_fn(imgs, n=12):
-        result = original_fn(imgs, n)
-        _dino_last[0] = rearrange(
-            result[-1][:, 1:, :], "B (H W) C -> B C H W", H=48
-        ).detach().cpu().half()
-        _dino_l4[0] = rearrange(
-            result[3][:, 1:, :], "B (H W) C -> B C H W", H=48
-        ).detach().cpu().half()
-        _dino_l8[0] = rearrange(
-            result[7][:, 1:, :], "B (H W) C -> B C H W", H=48
-        ).detach().cpu().half()
-        return result
-
-    dino_model.get_intermediate_layers = patched_fn
-
-    def unpatch():
-        dino_model.get_intermediate_layers = original_fn
-    return unpatch
-
 
 def build_teacher(config_file, weights_file, device):
     cfg = get_cfg()
@@ -470,12 +213,8 @@ def build_teacher(config_file, weights_file, device):
     return model
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Text features — uses teacher CLIP text encoder (same as all other scripts)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def remove_gsnet_clip_cache_hooks(gsnet):
-    """Remove GSNet's permanent CLIP image hooks; this script uses explicit hooks."""
+    """Remove GSNet's permanent CLIP skip hooks; fine-tune uses temporary hooks."""
     clip_model = gsnet.sem_seg_head.predictor.clip_model
     removed = 0
     for idx in getattr(gsnet, "layer_indexes", []):
@@ -505,7 +244,7 @@ def release_unused_gsnet(gsnet):
 
 
 def build_text_features(class_json, clip_model, device):
-    import clip as openai_clip
+    from gs_net.third_party import clip as openai_clip
     with open(class_json) as f:
         class_names = json.load(f)
     templates = ["a photo of a {}."]
@@ -572,7 +311,7 @@ def run_distill_epoch(teacher, student, loader, optimizer, scaler, device, amp,
                 optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=amp):
-                pred = student(tips_normalise(images))
+                pred = student(clip_normalise(images))
                 breakdown = distillation_loss_per_branch(pred, targets)
                 loss = breakdown["total"]
 
@@ -616,7 +355,7 @@ def run_distill_epoch(teacher, student, loader, optimizer, scaler, device, amp,
 
 
 def run_distillation(args, teacher, student, device, output_dir, use_wandb):
-    full_ds = ImageDataset(args.image_dir, resolution=448)
+    full_ds = ImageDataset(args.image_dir, resolution=384)
     n_val   = max(1, int(len(full_ds) * args.val_fraction))
     n_train = len(full_ds) - n_val
     gen = torch.Generator().manual_seed(42)
@@ -705,9 +444,9 @@ def run_distillation(args, teacher, student, device, output_dir, use_wandb):
 # Phase 3 — Segmentation fine-tune
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb):
-    clip_model        = gsnet.sem_seg_head.predictor.clip_model
-    clip_skip_indices = tuple(args.tips_skip_layers)
+def run_finetune(args, gsnet, student, device, output_dir, use_wandb):
+    clip_model       = gsnet.sem_seg_head.predictor.clip_model
+    clip_skip_indices = tuple(gsnet.layer_indexes)
     remove_gsnet_clip_cache_hooks(gsnet)
 
     ripd              = gsnet.sem_seg_head.predictor.transformer
@@ -716,23 +455,43 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
     dino_decod_proj1  = gsnet.dino_decod_proj1
     dino_decod_proj2  = gsnet.dino_decod_proj2
 
-    for p in ripd.parameters():
-        p.requires_grad = False
+    ripd_unfrozen         = args.unfreeze_ripd or args.warmup_decoder_epochs > 0
+    decoder_proj_unfrozen = ripd_unfrozen or args.train_decoder_projections
 
     decoder_proj_modules = [m for m in [clip_upsample1, clip_upsample2,
                                          dino_decod_proj1, dino_decod_proj2]
                              if m is not None]
-    for m in decoder_proj_modules:
-        for p in m.parameters():
-            p.requires_grad = False
 
     release_unused_gsnet(gsnet)
     gc.collect()
+
+    clip_model = clip_model.to(device)
+    ripd = ripd.to(device)
+    for m in decoder_proj_modules:
+        m.to(device)
     torch.cuda.empty_cache()
+
+    for p in ripd.parameters():
+        p.requires_grad = ripd_unfrozen
+    for m in decoder_proj_modules:
+        for p in m.parameters():
+            p.requires_grad = decoder_proj_unfrozen
+
+    warmup = args.warmup_decoder_epochs
+    if warmup > 0:
+        for p in student.parameters():
+            p.requires_grad = False
+        print(f"  RIPD decoder unfrozen. Student heads frozen for {warmup}-epoch warmup.")
+    elif ripd_unfrozen:
+        print("  RIPD unfrozen for fine-tuning.")
+    else:
+        print("  RIPD frozen; using checkpoint-loaded decoder weights.")
+    if decoder_proj_unfrozen:
+        print("  Decoder bridge projections trainable.")
 
     text_feats = build_text_features(args.class_json, clip_model, device)
 
-    full_ds = SegDataset(args.image_dir, args.label_dir, resolution=448)
+    full_ds = SegDataset(args.image_dir, args.label_dir)
     n_val   = max(1, int(len(full_ds) * args.val_fraction))
     n_train = len(full_ds) - n_val
     gen = torch.Generator().manual_seed(42)
@@ -750,13 +509,23 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
             + list(student.dino_down_branch.parameters())
             + list(student.dino_l4_branch.parameters())
             + list(student.dino_l8_branch.parameters())
-            + list(student.clip_skip_adapters.parameters())
         )
 
     def _decoder_proj_params():
         return [p for m in decoder_proj_modules for p in m.parameters()]
 
-    active_params = _student_head_params()
+    if warmup > 0:
+        active_params = []
+        if ripd_unfrozen:
+            active_params += list(ripd.parameters())
+        if decoder_proj_unfrozen:
+            active_params += _decoder_proj_params()
+    else:
+        active_params = _student_head_params()
+        if ripd_unfrozen:
+            active_params += list(ripd.parameters())
+        if decoder_proj_unfrozen:
+            active_params += _decoder_proj_params()
 
     optimizer  = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
     scaler     = GradScaler(enabled=args.amp)
@@ -764,51 +533,59 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
     best_val_loss = float("inf")
     best_path = os.path.join(output_dir, "finetune_best.pth")
 
+    _all_clip_layers = sorted(set(list(clip_skip_indices) + list(student.clip_layers)))
+
     def _save(path, epoch, avg_val):
         torch.save({
             "epoch": epoch,
             "student": student.state_dict(),
-            "ripd": None,
-            "clip_upsample1":   None,
-            "clip_upsample2":   None,
-            "dino_decod_proj1": None,
-            "dino_decod_proj2": None,
+            "ripd": ripd.state_dict() if ripd_unfrozen else None,
+            "clip_upsample1":   clip_upsample1.state_dict()  if decoder_proj_unfrozen and clip_upsample1  is not None else None,
+            "clip_upsample2":   clip_upsample2.state_dict()  if decoder_proj_unfrozen and clip_upsample2  is not None else None,
+            "dino_decod_proj1": dino_decod_proj1.state_dict() if decoder_proj_unfrozen and dino_decod_proj1 is not None else None,
+            "dino_decod_proj2": dino_decod_proj2.state_dict() if decoder_proj_unfrozen and dino_decod_proj2 is not None else None,
             "val_loss": avg_val,
             "args": vars(args),
         }, path)
 
     for epoch in range(args.finetune_epochs):
-        student.train()
-        ripd.eval()
+        if warmup > 0 and epoch == warmup:
+            for p in _student_head_params():
+                p.requires_grad = True
+            active_params = _student_head_params()
+            if ripd_unfrozen:
+                active_params += list(ripd.parameters())
+            if decoder_proj_unfrozen:
+                active_params += _decoder_proj_params()
+            optimizer = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
+            print(f"  Epoch {epoch+1}: student heads unfrozen — joint fine-tuning begins.")
+
+        student_training = (warmup == 0) or (epoch >= warmup)
+        student.train() if student_training else student.eval()
+        if ripd_unfrozen:
+            ripd.train()
 
         train_loss = 0.0
         n_train_batches = 0
         grad_accum = args.grad_accum
         optimizer.zero_grad(set_to_none=True)
-        _all_tips_layers = sorted(set(list(clip_skip_indices) + list(student.tips_layers)))
 
-        for step, (images, labels) in enumerate(tqdm(train_loader,
-                                    desc=f"[Finetune] Epoch {epoch+1}/{args.finetune_epochs} [train]")):
+        for step, (images, labels) in enumerate(tqdm(train_loader, desc=f"[Finetune] Epoch {epoch+1}/{args.finetune_epochs} [train]")):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             B = images.shape[0]
             tf = text_feats.detach().expand(B, -1, -1, -1)
 
-            # ── TIPSv2 forward (frozen, one pass for both RIPD skips + student trunk) ──
             with torch.no_grad():
                 with autocast(enabled=args.amp):
-                    res3, skips = get_tips_skips(tips_model, images,
-                                                  _all_tips_layers)
+                    clip_features, _all_skips = get_clip_skips(
+                        clip_model, images, _all_clip_layers)
                     l0, l1 = clip_skip_indices
-                    _stacked = torch.cat([skips[l] for l in student.tips_layers], dim=1)
+                    res4 = clip_upsample1(_all_skips[l0]) if clip_upsample1 is not None else None
+                    res5 = clip_upsample2(_all_skips[l1]) if clip_upsample2 is not None else None
+                    _stacked = torch.cat([_all_skips[l] for l in student.clip_layers], dim=1)
+                    del _all_skips
 
-            with autocast(enabled=args.amp):
-                res4_raw = student.adapt_clip_skip(skips[l0], 0) if clip_upsample1 is not None else None
-                res5_raw = student.adapt_clip_skip(skips[l1], 1) if clip_upsample2 is not None else None
-                res4 = clip_upsample1(res4_raw) if res4_raw is not None else None
-                res5 = clip_upsample2(res5_raw) if res5_raw is not None else None
-
-            # ── Student: per-branch checkpointing ────────────────────────────────
             if student.training:
                 with autocast(enabled=args.amp):
                     _trunk = grad_ckpt.checkpoint(student.shared_trunk, _stacked, use_reentrant=False)
@@ -843,10 +620,12 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
                 dino_L8_proj = dino_decod_proj2(_dino_L8) if _dino_L8 is not None else None
             del _dino_L4, _dino_L8
 
-            clip_guidance = (res3, res4, res5)
+            clip_res3 = rearrange(clip_features[:, 1:, :], "B (H W) C -> B C H W", H=24)
+            clip_guidance = (clip_res3, res4, res5)
+            del clip_features
 
             logit = ripd(
-                res3,
+                clip_res3,
                 dino_down,
                 tf,
                 clip_guidance,
@@ -861,10 +640,13 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
                 del logit_up
             loss_value = loss.detach().item() * grad_accum
 
-            if args.amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            try:
+                if args.amp:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            except RuntimeError:
+                raise
 
             is_last_step = (step + 1 == len(train_loader))
             if (step + 1) % grad_accum == 0 or is_last_step:
@@ -880,44 +662,48 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
 
             train_loss += loss_value
             n_train_batches += 1
-            del loss, loss_value, dino_down, tf, clip_guidance, dino_L4_proj, dino_L8_proj
-            del res3, res4, res5, skips, images, labels
+            del loss, loss_value, dino_down, tf, clip_res3, clip_guidance, dino_L4_proj, dino_L8_proj
+            del res4, res5, images, labels
 
         student.eval()
-        ripd.eval()
+        if ripd_unfrozen:
+            ripd.eval()
         val_loss = 0.0
         n_val_batches = 0
         with torch.no_grad():
-            for images, labels in tqdm(val_loader,
-                                        desc=f"[Finetune] Epoch {epoch+1}/{args.finetune_epochs} [val]"):
+            for images, labels in tqdm(val_loader, desc=f"[Finetune] Epoch {epoch+1}/{args.finetune_epochs} [val]"):
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
                 B = images.shape[0]
-                tf = text_feats.expand(B, -1, -1, -1)
+                tf = text_feats.detach().expand(B, -1, -1, -1)
                 with autocast(enabled=args.amp):
-                    logit = tips_inference(
+                    logit = gs_distill_inference(
                         image=images, text_feats=tf, student=student,
-                        tips_model=tips_model, ripd=ripd,
+                        clip_model=clip_model, ripd=ripd,
                         clip_upsample1=clip_upsample1, clip_upsample2=clip_upsample2,
                         dino_decod_proj1=dino_decod_proj1, dino_decod_proj2=dino_decod_proj2,
-                        skip_layer_indices=clip_skip_indices,
+                        clip_skip_layer_indices=clip_skip_indices,
                     )
                     logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                               mode="bilinear", align_corners=False)
+                    del logit
                     loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx)
+                    del logit_up
                 val_loss += loss.item()
                 n_val_batches += 1
+                del loss, tf, images, labels
 
         avg_train = train_loss / max(n_train_batches, 1)
         avg_val   = val_loss   / max(n_val_batches,   1)
-        print(f"[Finetune] Epoch {epoch+1:3d}/{args.finetune_epochs}  "
-              f"train={avg_train:.4f}  val={avg_val:.4f}")
+        phase     = "warmup" if (warmup > 0 and epoch < warmup) else "joint"
+        print(f"[Finetune] Epoch {epoch+1:3d}/{args.finetune_epochs}  [{phase}]  train={avg_train:.4f}  val={avg_val:.4f}")
 
         if use_wandb:
             wandb.log({
                 "finetune/epoch":      epoch + 1,
                 "finetune/train/loss": avg_train,
                 "finetune/val/loss":   avg_val,
+                "finetune/phase":      phase,
             }, step=args.distill_epochs + epoch + 1)
 
         _save(os.path.join(output_dir, "finetune_latest.pth"), epoch, avg_val)
@@ -935,32 +721,35 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="TIPSv2-backed GS-Distill: Phase 2 + Phase 3")
-    p.add_argument("--gsnet-config",    required=True)
-    p.add_argument("--gsnet-weights",   required=True)
-    p.add_argument("--image-dir",       required=True)
-    p.add_argument("--label-dir",       required=True)
-    p.add_argument("--class-json",      default="datasets/landdiscover.json")
-    p.add_argument("--output-dir",      default="output/ashie/tips")
-    p.add_argument("--tips-model",      default="google/tipsv2-b14")
-    p.add_argument("--distill-epochs",  type=int,   default=30)
-    p.add_argument("--finetune-epochs", type=int,   default=15)
-    p.add_argument("--batch-size",      type=int,   default=4)
-    p.add_argument("--lr",              type=float, default=1e-5)
-    p.add_argument("--weight-decay",    type=float, default=1e-4)
-    p.add_argument("--d-dino",          type=int,   default=768)
-    p.add_argument("--tips-layers",     type=int,   nargs="+", default=TIPS_LAYERS_DEFAULT)
-    p.add_argument("--tips-skip-layers", type=int,  nargs="+", default=[3, 7])
-    p.add_argument("--val-fraction",    type=float, default=0.05)
-    p.add_argument("--num-workers",     type=int,   default=4)
-    p.add_argument("--grad-accum",      type=int,   default=1,
+    p = argparse.ArgumentParser(description="CLIP-backed GS-Distill: Phase 2 + Phase 3")
+    p.add_argument("--gsnet-config",   required=True)
+    p.add_argument("--gsnet-weights",  required=True)
+    p.add_argument("--image-dir",      required=True)
+    p.add_argument("--label-dir",      required=True)
+    p.add_argument("--class-json",     default="datasets/landdiscover.json")
+    p.add_argument("--output-dir",     default="output/ashie/clip")
+    p.add_argument("--distill-epochs", type=int,   default=30)
+    p.add_argument("--finetune-epochs",type=int,   default=15)
+    p.add_argument("--batch-size",     type=int,   default=4)
+    p.add_argument("--lr",             type=float, default=1e-5)
+    p.add_argument("--weight-decay",   type=float, default=1e-4)
+    p.add_argument("--d-dino",         type=int,   default=768)
+    p.add_argument("--clip-layers",    type=int,   nargs="+", default=[8, 16, 20, 23])
+    p.add_argument("--val-fraction",   type=float, default=0.05)
+    p.add_argument("--num-workers",    type=int,   default=4)
+    p.add_argument("--grad-accum",     type=int,   default=1,
                    help="Gradient accumulation steps (effective batch = batch-size * grad-accum).")
-    p.add_argument("--amp",             action="store_true")
-    p.add_argument("--device",          default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--log-interval",    type=int,   default=50)
-    p.add_argument("--wandb-project",   default="gs-distill")
-    p.add_argument("--wandb-run",       default=None)
-    p.add_argument("--no-wandb",        action="store_true")
+    p.add_argument("--unfreeze-ripd",            action="store_true")
+    p.add_argument("--train-decoder-projections", action="store_true",
+                   help="Train GSNet CLIP/DINO decoder bridge projections while keeping RIPD frozen.")
+    p.add_argument("--warmup-decoder-epochs",    type=int, default=0,
+                   help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
+    p.add_argument("--amp",            action="store_true")
+    p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--log-interval",   type=int,   default=50)
+    p.add_argument("--wandb-project",  default="gs-distill")
+    p.add_argument("--wandb-run",      default=None)
+    p.add_argument("--no-wandb",       action="store_true")
     return p.parse_args()
 
 
@@ -973,35 +762,24 @@ def main():
     if use_wandb:
         wandb.init(project=args.wandb_project, name=args.wandb_run, config=vars(args))
 
-    # ── Load TIPSv2 (student backbone) ───────────────────────────────────────
-    print(f"Loading TIPSv2 from {args.tips_model} ...")
-    tips_model = AutoModel.from_pretrained(args.tips_model, trust_remote_code=True).to(device)
-    tips_model.eval()
-    for p in tips_model.parameters():
-        p.requires_grad = False
-
-    native_res = _tips_native_res(tips_model)
-    backbone_dim_check = tips_model.config.embed_dim
-    print(f"  TIPSv2 native res={native_res}  backbone_dim={backbone_dim_check}"
-          f"  layers={args.tips_layers}")
-
     # ── Load GSNet teacher ────────────────────────────────────────────────────
     print(f"Loading GSNet teacher from {args.gsnet_weights} ...")
     teacher = build_teacher(args.gsnet_config, args.gsnet_weights, str(device))
     teacher = teacher.to(device)
 
     unpatch_dino = _patch_dino(teacher.dino_model)
-    clip_skip_dims = (
-        teacher.upsample1.in_channels if teacher.upsample1 is not None else backbone_dim_check,
-        teacher.upsample2.in_channels if teacher.upsample2 is not None else backbone_dim_check,
-    )
 
-    # ── Build student ─────────────────────────────────────────────────────────
-    student = TIPSStudent(
-        tips_model=tips_model,
+    # ── Build student (reuse teacher's fine-tuned CLIP backbone) ─────────────
+    print("Reusing teacher's fine-tuned CLIP as student backbone ...")
+    clip_model = teacher.sem_seg_head.predictor.clip_model
+    clip_model.eval()
+    for p in clip_model.parameters():
+        p.requires_grad = False
+
+    student = GSDistillStudent(
+        clip_model=clip_model,
         d_dino=args.d_dino,
-        tips_layers=args.tips_layers,
-        clip_skip_dims=clip_skip_dims,
+        clip_layers=args.clip_layers,
     ).to(device)
 
     n_params = sum(p.numel() for p in student.trainable_parameters())
@@ -1009,7 +787,7 @@ def main():
 
     # ── Phase 2: Distillation ─────────────────────────────────────────────────
     print("\n" + "="*60)
-    print("Phase 2 — Online distillation (TIPSv2 student ← GSNet teacher)")
+    print("Phase 2 — Online distillation (CLIP student ← GSNet teacher)")
     print("="*60)
     best_distill_ckpt = run_distillation(args, teacher, student, device,
                                           args.output_dir, use_wandb)
@@ -1025,8 +803,7 @@ def main():
     print("\n" + "="*60)
     print("Phase 3 — Segmentation fine-tune on LD50K")
     print("="*60)
-    run_finetune(args, teacher, student, tips_model, device,
-                 args.output_dir, use_wandb)
+    run_finetune(args, teacher, student, device, args.output_dir, use_wandb)
 
     if use_wandb:
         wandb.finish()

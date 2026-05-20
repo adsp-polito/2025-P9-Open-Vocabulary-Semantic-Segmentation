@@ -1,8 +1,9 @@
 """
 Distillation loss for GS-Distill.
 
-Per-branch: MSE + (1 - cosine_similarity) applied to the flattened spatial tensor.
-The total loss sums contributions from all three branches.
+Per-branch: Smooth L1 + (1 - cosine_similarity) applied to flattened spatial
+tensors. The dynamic CLIP path distills text-independent DINO substitute
+features: dino_down, dino_L4, and dino_L8.
 """
 
 import torch
@@ -14,14 +15,14 @@ def distillation_loss(pred: dict, target: dict) -> torch.Tensor:
     Compute the combined distillation loss across all three prediction branches.
 
     Args:
-        pred:   dict with keys 'fused_corr_embed', 'dino_L4', 'dino_L8' (student outputs).
+        pred:   dict with keys 'dino_down', 'dino_L4', 'dino_L8'.
         target: dict with same keys (teacher cache loaded from .pt files).
 
     Returns:
         Scalar loss tensor.
     """
     loss = torch.tensor(0.0, device=next(iter(pred.values())).device)
-    for key in ("fused_corr_embed", "clip_embed_corr", "dino_L4", "dino_L8"):
+    for key in ("dino_down", "dino_L4", "dino_L8"):
         p = pred[key].float()
         t = target[key].float()
         mse = F.smooth_l1_loss(p, t)
@@ -39,11 +40,11 @@ def distillation_loss_per_branch(pred: dict, target: dict) -> dict:
     Same as distillation_loss but returns a per-branch breakdown for logging.
 
     Returns:
-        dict with keys: 'fused_corr_embed', 'dino_L4', 'dino_L8', 'total'.
+        dict with keys: 'dino_down', 'dino_L4', 'dino_L8', 'total'.
     """
     breakdown = {}
     total = torch.tensor(0.0, device=next(iter(pred.values())).device)
-    for key in ("fused_corr_embed", "clip_embed_corr", "dino_L4", "dino_L8"):
+    for key in ("dino_down", "dino_L4", "dino_L8"):
         p = pred[key].float()
         t = target[key].float()
         mse = F.smooth_l1_loss(p, t)

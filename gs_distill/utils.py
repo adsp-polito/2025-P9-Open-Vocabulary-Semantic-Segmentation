@@ -29,7 +29,7 @@ def extract_clip_layers(clip_model, image: torch.Tensor, layers: List[int]) -> t
     Args:
         clip_model: frozen OpenAI CLIP model.
         image: (B, 3, H, W) pre-normalised input (any spatial size).
-        layers: list of resblock indices to hook, e.g. [4, 8, 10, 12].
+        layers: list of resblock indices to hook, e.g. [8, 16, 20, 23] for ViT-L.
 
     Returns:
         (B, len(layers)*C, H_grid, W_grid) stacked spatial features.

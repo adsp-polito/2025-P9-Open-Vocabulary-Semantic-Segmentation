@@ -1,12 +1,12 @@
 """
 SigLIP backbone — combined Phase 2 (online distillation) + Phase 3 (segmentation fine-tune).
 
-Replaces the OpenAI CLIP backbone with google/siglip-base-patch16-384 (HuggingFace transformers).
-The student architecture, all 4 distillation targets, RIPD decoder, and LD50K pipeline
-are identical to the CLIP-based GS-Distill pipeline.
+Replaces the OpenAI CLIP image backbone with google/siglip-base-patch16-384
+(HuggingFace transformers). The student predicts text-independent DINO
+substitutes and normal RIPD computes dynamic text-conditioned correlations.
 
 Key differences from the CLIP pipeline:
-  - SigLIP backbone loaded via AutoModel / AutoTokenizer (HuggingFace)
+  - SigLIP backbone loaded via AutoModel (HuggingFace)
   - Intermediate layers hooked on vision_model.encoder.layers[l] (output: B x seq x C)
   - Image normalisation: mean=0.5, std=0.5  (SigLIP convention)
   - Text features: SigLIP text encoder via model.get_text_features()
@@ -53,11 +53,10 @@ from einops import rearrange
 from tqdm import tqdm
 
 import wandb
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
 
 from detectron2.config import get_cfg
 from detectron2.checkpoint import DetectionCheckpointer
-from ripd_lite import patch_ripd
 
 from gs_net import add_cat_seg_config
 import gs_net  # noqa: side-effect registrations
@@ -204,20 +203,18 @@ def siglip_normalise(images: torch.Tensor) -> torch.Tensor:
 
 class SigLIPStudent(nn.Module):
     """
-    GS-Distill student with SigLIP ViT backbone instead of OpenAI CLIP.
+    GS-Distill student with a frozen SigLIP image backbone.
 
-    Architecture is identical to GSDistillStudent:
+    Predicts text-independent DINO substitutes and optional decoder skip
+    adapters. RIPD remains responsible for dynamic text-conditioned fusion.
       - Frozen SigLIP ViT (multi-layer features)
       - Shared conv trunk (4*C → 512 channels)
-      - Fusion head:  predicts fused_corr_embed  (B, hidden_dim, T, H, W)
-      - CLIP head:    predicts clip_embed_corr   (B, hidden_dim, T, H, W)
       - DINO-L4 head: predicts dino_L4           (B, d_dino, 2H, 2W)
       - DINO-L8 head: predicts dino_L8           (B, d_dino, 2H, 2W)
     """
 
-    def __init__(self, siglip_model: nn.Module, hidden_dim: int = 128,
-                 d_dino: int = 768, num_classes: int = 40,
-                 siglip_layers: list = None):
+    def __init__(self, siglip_model: nn.Module, d_dino: int = 768,
+                 siglip_layers: list = None, clip_skip_dims=None):
         super().__init__()
 
         self.siglip_model = siglip_model
@@ -225,13 +222,12 @@ class SigLIPStudent(nn.Module):
             p.requires_grad = False
 
         self.siglip_layers = siglip_layers if siglip_layers is not None else SIGLIP_LAYERS_DEFAULT
-        self.hidden_dim   = hidden_dim
         self.d_dino       = d_dino
-        self.num_classes  = num_classes
 
         # Infer hidden dim from SigLIP config
         clip_dim  = siglip_model.config.vision_config.hidden_size   # 768 for ViT-B/16
         trunk_in  = len(self.siglip_layers) * clip_dim
+        clip_skip_dims = clip_skip_dims or (clip_dim, clip_dim)
 
         self.shared_trunk = nn.Sequential(
             nn.Conv2d(trunk_in, TRUNK_OUT, kernel_size=3, padding=1),
@@ -240,10 +236,11 @@ class SigLIPStudent(nn.Module):
             nn.GELU(),
         )
 
-        self.fusion_branch = nn.Conv2d(TRUNK_OUT, hidden_dim * num_classes,
-                                       kernel_size=3, padding=1)
-        self.clip_embed_branch = nn.Conv2d(TRUNK_OUT, hidden_dim * num_classes,
-                                           kernel_size=3, padding=1)
+        self.dino_down_branch = nn.Sequential(
+            nn.Conv2d(TRUNK_OUT, d_dino, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(d_dino, d_dino, kernel_size=3, padding=1),
+        )
         self.dino_l4_branch = nn.Sequential(
             nn.ConvTranspose2d(TRUNK_OUT, d_dino, kernel_size=2, stride=2),
             nn.GELU(),
@@ -254,35 +251,43 @@ class SigLIPStudent(nn.Module):
             nn.GELU(),
             nn.Conv2d(d_dino, d_dino, kernel_size=3, padding=1),
         )
+        self.clip_skip_adapters = nn.ModuleList([
+            nn.Identity() if target_dim == clip_dim else nn.Conv2d(clip_dim, target_dim, kernel_size=1)
+            for target_dim in clip_skip_dims
+        ])
+        for adapter in self.clip_skip_adapters:
+            if isinstance(adapter, nn.Conv2d):
+                nn.init.zeros_(adapter.weight)
+                if adapter.bias is not None:
+                    nn.init.zeros_(adapter.bias)
+                n = min(adapter.out_channels, adapter.in_channels)
+                with torch.no_grad():
+                    for i in range(n):
+                        adapter.weight[i, i, 0, 0] = 1.0
 
     def forward(self, image: torch.Tensor) -> dict:
-        B = image.shape[0]
-
         with torch.no_grad():
             stacked = extract_siglip_layers(self.siglip_model, image, self.siglip_layers)
 
         trunk_out = self.shared_trunk(stacked)   # (B, 512, H_grid, W_grid)
 
-        def _corr_reshape(x):
-            return rearrange(x, "B (C T) H W -> B C T H W",
-                             C=self.hidden_dim, T=self.num_classes)
-
         return {
-            "fused_corr_embed": _corr_reshape(self.fusion_branch(trunk_out)),
-            "clip_embed_corr":  _corr_reshape(self.clip_embed_branch(trunk_out)) if self.clip_embed_branch is not None else None,
+            "dino_down": self.dino_down_branch(trunk_out),
             "dino_L4": self.dino_l4_branch(trunk_out),
             "dino_L8": self.dino_l8_branch(trunk_out),
         }
 
+    def adapt_clip_skip(self, skip: torch.Tensor, index: int) -> torch.Tensor:
+        return self.clip_skip_adapters[index](skip)
+
     def trainable_parameters(self):
         params = (
             list(self.shared_trunk.parameters())
-            + list(self.fusion_branch.parameters())
+            + list(self.dino_down_branch.parameters())
             + list(self.dino_l4_branch.parameters())
             + list(self.dino_l8_branch.parameters())
+            + list(self.clip_skip_adapters.parameters())
         )
-        if self.clip_embed_branch is not None:
-            params += list(self.clip_embed_branch.parameters())
         return params
 
 
@@ -313,19 +318,20 @@ def siglip_inference(
         logit: (B, T, H, W) segmentation logits.
     """
     with torch.no_grad():
-        cls_token, skips = get_siglip_skips(siglip_model, image,
-                                             list(skip_layer_indices))
+        last_hidden_state, skips = get_siglip_skips(
+            siglip_model, image, list(skip_layer_indices)
+        )
         l0, l1 = skip_layer_indices
-        res4_raw = skips[l0]
-        res5_raw = skips[l1]
-        res4 = clip_upsample1(res4_raw) if clip_upsample1 is not None else None
-        res5 = clip_upsample2(res5_raw) if clip_upsample2 is not None else None
 
     student_out = student(image)
-    fused_corr_embed  = student_out["fused_corr_embed"]
+    predicted_dino_down = student_out["dino_down"]
     predicted_dino_L4 = student_out["dino_L4"]
     predicted_dino_L8 = student_out["dino_L8"]
 
+    res4_raw = student.adapt_clip_skip(skips[l0], 0) if clip_upsample1 is not None else None
+    res5_raw = student.adapt_clip_skip(skips[l1], 1) if clip_upsample2 is not None else None
+    res4 = clip_upsample1(res4_raw) if res4_raw is not None else None
+    res5 = clip_upsample2(res5_raw) if res5_raw is not None else None
     dino_L4_proj = dino_decod_proj1(predicted_dino_L4) if dino_decod_proj1 is not None else None
     dino_L8_proj = dino_decod_proj2(predicted_dino_L8) if dino_decod_proj2 is not None else None
 
@@ -333,15 +339,10 @@ def siglip_inference(
     # last_hidden_state: (B, 576, C) for siglip-base-patch16-384
     res3 = rearrange(last_hidden_state, "B (H W) C -> B C H W", H=24)
 
-    clip_guidance = {"res3": res3, "res4": res4, "res5": res5}
+    clip_guidance = (res3, res4, res5)
     dino_guidance = [dino_L4_proj, dino_L8_proj]
 
-    logit = ripd.forward_from_fusion(
-        fused_corr_embed=fused_corr_embed,
-        text_feats=text_feats,
-        appearance_guidance=clip_guidance,
-        dino_guidance=dino_guidance,
-    )
+    logit = ripd(res3, predicted_dino_down, text_feats, clip_guidance, dino_guidance)
     return logit
 
 
@@ -418,57 +419,12 @@ class SegDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Teacher setup (unchanged from train_distill_online.py)
+# Teacher setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-_hook_state = {"fused_corr_embed": None, "clip_embed_corr": None}
+_dino_last  = [None]
 _dino_l4    = [None]
 _dino_l8    = [None]
-
-
-def _patch_ripd(ripd_module):
-    original_forward = ripd_module.forward
-
-    def patched_forward(img_feats, dino_feat, text_feats, appearance_guidance, dino_guidance):
-        if dino_feat is not None and img_feats is not None:
-            if ripd_module.fusion_type == 'query_guided':
-                corr      = ripd_module.correlation(img_feats, text_feats)
-                dino_corr = ripd_module.correlation(dino_feat, text_feats)
-                fused_corr, clip_embed_corr, _ = ripd_module.corr_fusion_embed_seperate(
-                    clip_corr=corr, dino_corr=dino_corr,
-                )
-                fused_corr_embed = fused_corr + clip_embed_corr
-            elif ripd_module.fusion_type == 'simple_concatenation':
-                simple_corr = ripd_module.simple_concatenation_corr(img_feats, dino_feat, text_feats)
-                T = simple_corr.shape[2]
-                fused_corr_embed = ripd_module.simple_concatenation_corr_embed(
-                    rearrange(simple_corr, "B C T H W -> (B T) C H W"))
-                fused_corr_embed = rearrange(fused_corr_embed, "(B T) C H W -> B C T H W", T=T)
-                clip_embed_corr  = torch.zeros_like(fused_corr_embed)
-            elif ripd_module.fusion_type == 'fusion_query':
-                fused_feat = ripd_module.fusion_feats(torch.cat([img_feats, dino_feat], dim=1))
-                corr = ripd_module.correlation(fused_feat, text_feats)
-                fused_corr_embed = ripd_module.corr_embed(corr)
-                clip_embed_corr  = torch.zeros_like(fused_corr_embed)
-        elif dino_feat is not None:
-            corr = ripd_module.correlation(dino_feat, text_feats)
-            fused_corr_embed = ripd_module.corr_embed(corr)
-            clip_embed_corr  = torch.zeros_like(fused_corr_embed)
-        elif img_feats is not None:
-            corr = ripd_module.correlation(img_feats, text_feats)
-            fused_corr_embed = ripd_module.corr_embed(corr)
-            clip_embed_corr  = torch.zeros_like(fused_corr_embed)
-
-        _hook_state["fused_corr_embed"] = fused_corr_embed.detach().cpu().half()
-        _hook_state["clip_embed_corr"]  = clip_embed_corr.detach().cpu().half()
-
-        return original_forward(img_feats, dino_feat, text_feats, appearance_guidance, dino_guidance)
-
-    ripd_module.forward = patched_forward
-
-    def unpatch():
-        ripd_module.forward = original_forward
-    return unpatch
 
 
 def _patch_dino(dino_model):
@@ -476,6 +432,9 @@ def _patch_dino(dino_model):
 
     def patched_fn(imgs, n=12):
         result = original_fn(imgs, n)
+        _dino_last[0] = rearrange(
+            result[-1][:, 1:, :], "B (H W) C -> B C H W", H=48
+        ).detach().cpu().half()
         _dino_l4[0] = rearrange(
             result[3][:, 1:, :], "B (H W) C -> B C H W", H=48
         ).detach().cpu().half()
@@ -580,7 +539,7 @@ def cosine_lr(optimizer, epoch, total_epochs, warmup_epochs, base_lr, min_lr=1e-
 # Phase 2 — Online distillation
 # ─────────────────────────────────────────────────────────────────────────────
 
-_BRANCH_KEYS = ("fused_corr_embed", "clip_embed_corr", "dino_L4", "dino_L8")
+_BRANCH_KEYS = ("dino_down", "dino_L4", "dino_L8")
 
 
 def run_distill_epoch(teacher, student, loader, optimizer, scaler, device, amp,
@@ -598,10 +557,12 @@ def run_distill_epoch(teacher, student, loader, optimizer, scaler, device, amp,
 
             with torch.no_grad():
                 teacher([{"image": (img * 255.0).clamp(0, 255)} for img in images])
+                dino_down = teacher.dino_down_sample(
+                    _dino_last[0].to(device).float()
+                )
 
             targets = {
-                "fused_corr_embed": _hook_state["fused_corr_embed"].to(device).float(),
-                "clip_embed_corr":  _hook_state["clip_embed_corr"].to(device).float(),
+                "dino_down": dino_down,
                 "dino_L4": _dino_l4[0].to(device).float(),
                 "dino_L8": _dino_l8[0].to(device).float(),
             }
@@ -635,8 +596,7 @@ def run_distill_epoch(teacher, student, loader, optimizer, scaler, device, amp,
                 avg = total_loss / n
                 tqdm.write(
                     f"  step {step+1:5d}  loss={avg:.4f}  "
-                    f"fused={branch_totals['fused_corr_embed']/n:.4f}  "
-                    f"clip={branch_totals['clip_embed_corr']/n:.4f}  "
+                    f"down={branch_totals['dino_down']/n:.4f}  "
                     f"l4={branch_totals['dino_L4']/n:.4f}  "
                     f"l8={branch_totals['dino_L8']/n:.4f}"
                 )
@@ -644,8 +604,7 @@ def run_distill_epoch(teacher, student, loader, optimizer, scaler, device, amp,
                     global_step = epoch * len(loader) + step + 1
                     wandb.log({
                         "distill/step/loss":    avg,
-                        "distill/step/fused":   branch_totals["fused_corr_embed"] / n,
-                        "distill/step/clip":    branch_totals["clip_embed_corr"]  / n,
+                        "distill/step/dino_down": branch_totals["dino_down"] / n,
                         "distill/step/dino_l4": branch_totals["dino_L4"] / n,
                         "distill/step/dino_l8": branch_totals["dino_L8"] / n,
                     }, step=global_step)
@@ -693,8 +652,7 @@ def run_distillation(args, teacher, student, device, output_dir, use_wandb):
         print(
             f"[Distill] Epoch {epoch+1:3d}/{args.distill_epochs}  lr={lr:.2e}  "
             f"train={train_loss:.4f}  val={val_loss:.4f}  ({elapsed:.0f}s)  "
-            f"val_fused={val_b['fused_corr_embed']:.4f}  "
-            f"val_clip={val_b['clip_embed_corr']:.4f}  "
+            f"val_down={val_b['dino_down']:.4f}  "
             f"val_l4={val_b['dino_L4']:.4f}  val_l8={val_b['dino_L8']:.4f}"
         )
 
@@ -704,13 +662,11 @@ def run_distillation(args, teacher, student, device, output_dir, use_wandb):
                 "distill/lr":            lr,
                 "distill/epoch_time_s":  elapsed,
                 "distill/train/loss":    train_loss,
-                "distill/train/fused":   train_b["fused_corr_embed"],
-                "distill/train/clip":    train_b["clip_embed_corr"],
+                "distill/train/dino_down": train_b["dino_down"],
                 "distill/train/dino_l4": train_b["dino_L4"],
                 "distill/train/dino_l8": train_b["dino_L8"],
                 "distill/val/loss":      val_loss,
-                "distill/val/fused":     val_b["fused_corr_embed"],
-                "distill/val/clip":      val_b["clip_embed_corr"],
+                "distill/val/dino_down": val_b["dino_down"],
                 "distill/val/dino_l4":   val_b["dino_L4"],
                 "distill/val/dino_l8":   val_b["dino_L8"],
             }, step=epoch + 1)
@@ -750,11 +706,10 @@ def run_distillation(args, teacher, student, device, output_dir, use_wandb):
 
 def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wandb):
     clip_model       = gsnet.sem_seg_head.predictor.clip_model
-    clip_skip_indices = tuple(gsnet.layer_indexes)
+    clip_skip_indices = tuple(args.siglip_skip_layers)
     remove_gsnet_clip_cache_hooks(gsnet)
 
     ripd              = gsnet.sem_seg_head.predictor.transformer
-    patch_ripd(ripd, args)
     clip_upsample1    = gsnet.upsample1
     clip_upsample2    = gsnet.upsample2
     dino_decod_proj1  = gsnet.dino_decod_proj1
@@ -774,7 +729,7 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Text features from teacher CLIP (same as train_finetune.py)
+    # Text features from teacher CLIP.
     text_feats = build_text_features(args.class_json, clip_model, device)
 
     full_ds = SegDataset(args.image_dir, args.label_dir)
@@ -792,9 +747,10 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
     def _student_head_params():
         return (
             list(student.shared_trunk.parameters())
-            + list(student.fusion_branch.parameters())
+            + list(student.dino_down_branch.parameters())
             + list(student.dino_l4_branch.parameters())
             + list(student.dino_l8_branch.parameters())
+            + list(student.clip_skip_adapters.parameters())
         )
 
     def _decoder_proj_params():
@@ -840,12 +796,16 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
             # ── SigLIP forward (frozen, one pass for both RIPD skips + student trunk) ──
             with torch.no_grad():
                 with autocast(enabled=args.amp):
-                    cls_token, skips = get_siglip_skips(siglip_model, images,
-                                                         _all_siglip_layers)
+                    last_hidden_state, skips = get_siglip_skips(siglip_model, images,
+                                                                 _all_siglip_layers)
                     l0, l1 = clip_skip_indices
-                    res4 = clip_upsample1(skips[l0]) if clip_upsample1 is not None else None
-                    res5 = clip_upsample2(skips[l1]) if clip_upsample2 is not None else None
                     _stacked = torch.cat([skips[l] for l in student.siglip_layers], dim=1)
+
+            with autocast(enabled=args.amp):
+                res4_raw = student.adapt_clip_skip(skips[l0], 0) if clip_upsample1 is not None else None
+                res5_raw = student.adapt_clip_skip(skips[l1], 1) if clip_upsample2 is not None else None
+                res4 = clip_upsample1(res4_raw) if res4_raw is not None else None
+                res5 = clip_upsample2(res5_raw) if res5_raw is not None else None
 
             # ── Student: per-branch checkpointing ────────────────────────────────
             if student.training:
@@ -853,12 +813,10 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
                     _trunk = grad_ckpt.checkpoint(student.shared_trunk, _stacked, use_reentrant=False)
                 del _stacked
 
-                def _fuse(_x):
+                def _down(_x):
                     with autocast(enabled=args.amp):
-                        return rearrange(student.fusion_branch(_x),
-                                         "B (C T) H W -> B C T H W",
-                                         C=student.hidden_dim, T=student.num_classes)
-                fused_corr_embed = grad_ckpt.checkpoint(_fuse, _trunk, use_reentrant=False)
+                        return student.dino_down_branch(_x)
+                dino_down = grad_ckpt.checkpoint(_down, _trunk, use_reentrant=False)
 
                 def _dl4(_x):
                     with autocast(enabled=args.amp):
@@ -874,9 +832,7 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
                 with torch.no_grad(), autocast(enabled=args.amp):
                     _trunk = student.shared_trunk(_stacked)
                     del _stacked
-                    fused_corr_embed = rearrange(student.fusion_branch(_trunk),
-                                                 "B (C T) H W -> B C T H W",
-                                                 C=student.hidden_dim, T=student.num_classes)
+                    dino_down = student.dino_down_branch(_trunk)
                     _dino_L4 = student.dino_l4_branch(_trunk) if dino_decod_proj1 is not None else None
                     _dino_L8 = student.dino_l8_branch(_trunk) if dino_decod_proj2 is not None else None
                     del _trunk
@@ -886,14 +842,15 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
                 dino_L8_proj = dino_decod_proj2(_dino_L8) if _dino_L8 is not None else None
             del _dino_L4, _dino_L8
 
-            res3 = rearrange(cls_token, "B (H W) C -> B C H W", H=24)
-            clip_guidance = {"res3": res3, "res4": res4, "res5": res5}
+            res3 = rearrange(last_hidden_state, "B (H W) C -> B C H W", H=24)
+            clip_guidance = (res3, res4, res5)
 
-            logit = ripd.forward_from_fusion(
-                fused_corr_embed=fused_corr_embed,
-                text_feats=tf,
-                appearance_guidance=clip_guidance,
-                dino_guidance=[dino_L4_proj, dino_L8_proj],
+            logit = ripd(
+                res3,
+                dino_down,
+                tf,
+                clip_guidance,
+                [dino_L4_proj, dino_L8_proj],
             )
 
             with autocast(enabled=args.amp):
@@ -923,8 +880,8 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
 
             train_loss += loss_value
             n_train_batches += 1
-            del loss, loss_value, fused_corr_embed, tf, clip_guidance, dino_L4_proj, dino_L8_proj
-            del res3, res4, res5, cls_token, skips, images, labels
+            del loss, loss_value, dino_down, tf, clip_guidance, dino_L4_proj, dino_L8_proj
+            del res3, res4, res5, last_hidden_state, skips, images, labels
 
         student.eval()
         ripd.eval()
@@ -989,10 +946,9 @@ def parse_args():
     p.add_argument("--batch-size",      type=int,   default=4)
     p.add_argument("--lr",              type=float, default=1e-5)
     p.add_argument("--weight-decay",    type=float, default=1e-4)
-    p.add_argument("--hidden-dim",      type=int,   default=128)
     p.add_argument("--d-dino",          type=int,   default=768)
-    p.add_argument("--num-classes",     type=int,   default=40)
     p.add_argument("--siglip-layers",   type=int,   nargs="+", default=SIGLIP_LAYERS_DEFAULT)
+    p.add_argument("--siglip-skip-layers", type=int, nargs="+", default=[3, 7])
     p.add_argument("--val-fraction",    type=float, default=0.05)
     p.add_argument("--num-workers",     type=int,   default=4)
     p.add_argument("--grad-accum",      type=int,   default=1,
@@ -1023,8 +979,8 @@ def main():
         p.requires_grad = False
 
     native_res = _siglip_native_res(siglip_model)
-    hidden_dim_check = siglip_model.config.vision_config.hidden_size
-    print(f"  SigLIP native res={native_res}  hidden_dim={hidden_dim_check}"
+    backbone_dim_check = siglip_model.config.vision_config.hidden_size
+    print(f"  SigLIP native res={native_res}  backbone_dim={backbone_dim_check}"
           f"  layers={args.siglip_layers}")
 
     # ── Load GSNet teacher ────────────────────────────────────────────────────
@@ -1032,16 +988,18 @@ def main():
     teacher = build_teacher(args.gsnet_config, args.gsnet_weights, str(device))
     teacher = teacher.to(device)
 
-    unpatch_ripd = _patch_ripd(teacher.sem_seg_head.predictor.transformer)
     unpatch_dino = _patch_dino(teacher.dino_model)
+    clip_skip_dims = (
+        teacher.upsample1.in_channels if teacher.upsample1 is not None else backbone_dim_check,
+        teacher.upsample2.in_channels if teacher.upsample2 is not None else backbone_dim_check,
+    )
 
     # ── Build student ─────────────────────────────────────────────────────────
     student = SigLIPStudent(
         siglip_model=siglip_model,
-        hidden_dim=args.hidden_dim,
         d_dino=args.d_dino,
-        num_classes=args.num_classes,
         siglip_layers=args.siglip_layers,
+        clip_skip_dims=clip_skip_dims,
     ).to(device)
 
     n_params = sum(p.numel() for p in student.trainable_parameters())
@@ -1054,14 +1012,12 @@ def main():
     best_distill_ckpt = run_distillation(args, teacher, student, device,
                                           args.output_dir, use_wandb)
 
-    unpatch_ripd()
     unpatch_dino()
 
     # ── Reload best distill checkpoint for Phase 3 ────────────────────────────
     print(f"\nReloading best distill checkpoint: {best_distill_ckpt}")
     ckpt = torch.load(best_distill_ckpt, map_location=device)
     student.load_state_dict(ckpt["student"])
-    student.clip_embed_branch = None  # distillation-only branch; saves ~47 MB during backward recompute
 
     # ── Phase 3: Segmentation fine-tune ───────────────────────────────────────
     print("\n" + "="*60)

@@ -61,6 +61,8 @@ nvidia-smi
     --finetune-epochs       15 \
     --batch-size            1 \
     --grad-accum            2 \
+    --siglip-layers         4 8 10 11 \
+    --siglip-skip-layers    3 7 \
     --lr                    1e-5 \
     --num-workers           2 \
     --amp \

@@ -14,7 +14,7 @@ set -euo pipefail
 PROJECT_ROOT="/nfs/home/hassan/2025-P9-Open-Vocabulary-Semantic-Segmentation"
 PYTHON="/nfs/home/hassan/miniconda3/envs/gsnet/bin/python3"
 cd "${PROJECT_ROOT}"
-mkdir -p jobs-ashie/logs output/ashie/finetune/eval
+mkdir -p jobs-ashie/logs output/ashie/clip/eval
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate gsnet
@@ -29,7 +29,7 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
 fi
 
 GSNET_WEIGHTS="output/gsnet_pretrain/model_final.pth"
-FINETUNE_CKPT="output/ashie/finetune/finetune_best.pth"
+FINETUNE_CKPT="output/ashie/clip/finetune_best.pth"
 
 if [[ ! -f "${GSNET_WEIGHTS}" ]]; then
     echo "[ERROR] GSNet checkpoint not found: ${GSNET_WEIGHTS}"; exit 1
@@ -41,7 +41,7 @@ fi
 echo "============================================================"
 echo "Eval — CLIP GS-Distill on Potsdam / FloodNet / FLAIR / FAST"
 echo "  Checkpoint: ${FINETUNE_CKPT}"
-echo "  Output:     output/ashie/finetune/eval"
+echo "  Output:     output/ashie/clip/eval"
 echo "============================================================"
 echo "Job ID: ${SLURM_JOB_ID:-N/A}   Node: ${SLURM_NODELIST:-N/A}"
 echo "Start:  $(date)"
@@ -53,11 +53,11 @@ nvidia-smi
     --gsnet-config  configs/vitl_336_dinov3.yaml \
     --gsnet-weights "${GSNET_WEIGHTS}" \
     --finetune-ckpt "${FINETUNE_CKPT}" \
-    --output-dir    output/ashie/finetune/eval \
+    --output-dir    output/ashie/clip/eval \
     --amp
 
 echo ""
 echo "============================================================"
-echo "Eval done. Results in output/ashie/finetune/eval/"
+echo "Eval done. Results in output/ashie/clip/eval/"
 echo "End: $(date)"
 echo "============================================================"

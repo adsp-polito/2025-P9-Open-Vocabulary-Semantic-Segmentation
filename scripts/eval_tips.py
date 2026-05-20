@@ -158,7 +158,6 @@ def load_model(gsnet_config, gsnet_weights, finetune_ckpt, tips_model_id, device
     for p in clip_model.parameters():
         p.requires_grad = False
 
-    clip_skip_indices  = tuple(gsnet.layer_indexes)
     remove_gsnet_clip_cache_hooks(gsnet)
     ripd               = gsnet.sem_seg_head.predictor.transformer
     clip_upsample1     = gsnet.upsample1
@@ -186,12 +185,17 @@ def load_model(gsnet_config, gsnet_weights, finetune_ckpt, tips_model_id, device
     print(f"Loading finetuned student from {finetune_ckpt} ...")
     ckpt = torch.load(finetune_ckpt, map_location=device)
     student_args = ckpt.get("args", {})
+    backbone_dim = tips_model.config.embed_dim
+    clip_skip_dims = (
+        clip_upsample1.in_channels if clip_upsample1 is not None else backbone_dim,
+        clip_upsample2.in_channels if clip_upsample2 is not None else backbone_dim,
+    )
+    clip_skip_indices = tuple(student_args.get("tips_skip_layers", [3, 7]))
     student = TIPSStudent(
         tips_model=tips_model,
-        hidden_dim=student_args.get("hidden_dim", 128),
         d_dino=student_args.get("d_dino", 768),
-        num_classes=student_args.get("num_classes", 40),
         tips_layers=student_args.get("tips_layers", TIPS_LAYERS_DEFAULT),
+        clip_skip_dims=clip_skip_dims,
     ).to(device)
     student.load_state_dict(ckpt["student"])
     student.eval()
