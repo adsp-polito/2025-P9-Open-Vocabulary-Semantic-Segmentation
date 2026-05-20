@@ -88,10 +88,23 @@ class GSDistillStudent(nn.Module):
             'dino_L4':          (B, d_dino, 48, 48)
             'dino_L8':          (B, d_dino, 48, 48)
         """
-        # Frozen CLIP multi-layer extraction → (B, trunk_in, 24, 24)
         with torch.no_grad():
             stacked = extract_clip_layers(self.clip_model, image, self.clip_layers)
+        return self.forward_from_features(stacked)
 
+    def forward_from_features(self, stacked: torch.Tensor) -> dict:
+        """
+        Run only the trainable heads given a pre-extracted CLIP feature stack.
+
+        Args:
+            stacked: (B, len(clip_layers)*C, H_grid, W_grid) — already extracted
+                     by an external get_clip_skips call so CLIP is not run again.
+
+        Returns dict with keys:
+            'dino_down':        (B, d_dino, 24, 24)
+            'dino_L4':          (B, d_dino, 48, 48)
+            'dino_L8':          (B, d_dino, 48, 48)
+        """
         trunk_out = self.shared_trunk(stacked)   # (B, 512, 24, 24)
 
         return {

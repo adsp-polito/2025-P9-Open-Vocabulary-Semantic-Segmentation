@@ -29,6 +29,9 @@ def gs_distill_inference(
     dino_decod_proj2: nn.Module,
     clip_skip_layer_indices=(7, 15),
     clip_resolution=(384, 384),
+    clip_features=None,
+    clip_skips=None,
+    student_clip_stacked=None,
 ) -> torch.Tensor:
     """
     Full GS-Distill inference for a single image batch.
@@ -45,25 +48,34 @@ def gs_distill_inference(
         dino_decod_proj2: GSNet's dino_decod_proj2 ConvTranspose2d (768→128, 2x) for DINOv3 L8 skip.
         clip_skip_layer_indices: CLIP resblock indices used for decoder skip connections (res4, res5).
         clip_resolution: spatial size used for CLIP forward pass.
+        clip_features:  pre-computed dense CLIP features (B, seq, C); if provided, skips CLIP forward.
+        clip_skips:     pre-computed skip dict {layer_idx: (B, C, H, W)}; required when clip_features is given.
+        student_clip_stacked: pre-extracted (B, trunk_in, H_grid, W_grid) for student heads;
+                              if provided, student.forward_from_features() is called instead of student().
 
     Returns:
         logit: (B, T, H, W) segmentation logits.
     """
     # ── 1. CLIP forward: base features + decoder skip connections ────────────
-    # CLIP is always frozen — extract under no_grad to avoid unnecessary graph.
+    if clip_features is None or clip_skips is None:
+        all_layers = sorted(set(list(clip_skip_layer_indices) + student.clip_layers))
+        with torch.no_grad():
+            clip_features, clip_skips = get_clip_skips(clip_model, image, all_layers)
+            if student_clip_stacked is None:
+                student_clip_stacked = torch.cat(
+                    [clip_skips[l] for l in student.clip_layers], dim=1
+                )
+
+    l0, l1 = clip_skip_layer_indices
     with torch.no_grad():
-        clip_features, clip_skips = get_clip_skips(
-            clip_model, image, list(clip_skip_layer_indices)
-        )
-        l0, l1 = clip_skip_layer_indices
-        res4_raw = clip_skips[l0]
-        res5_raw = clip_skips[l1]
-        res4 = clip_upsample1(res4_raw) if clip_upsample1 is not None else None
-        res5 = clip_upsample2(res5_raw) if clip_upsample2 is not None else None
+        res4 = clip_upsample1(clip_skips[l0]) if clip_upsample1 is not None else None
+        res5 = clip_upsample2(clip_skips[l1]) if clip_upsample2 is not None else None
 
     # ── 2. Student DINO substitute heads ─────────────────────────────────────
-    # Runs under autograd so gradients flow to student heads during fine-tuning.
-    student_out = student(image)
+    if student_clip_stacked is not None:
+        student_out = student.forward_from_features(student_clip_stacked)
+    else:
+        student_out = student(image)
     predicted_dino_down = student_out["dino_down"]        # (B, 768, 24, 24)
     predicted_dino_L4 = student_out["dino_L4"]            # (B, 768, 48, 48)
     predicted_dino_L8 = student_out["dino_L8"]            # (B, 768, 48, 48)

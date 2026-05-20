@@ -268,9 +268,10 @@ class SigLIPStudent(nn.Module):
     def forward(self, image: torch.Tensor) -> dict:
         with torch.no_grad():
             stacked = extract_siglip_layers(self.siglip_model, image, self.siglip_layers)
+        return self.forward_from_features(stacked)
 
+    def forward_from_features(self, stacked: torch.Tensor) -> dict:
         trunk_out = self.shared_trunk(stacked)   # (B, 512, H_grid, W_grid)
-
         return {
             "dino_down": self.dino_down_branch(trunk_out),
             "dino_L4": self.dino_l4_branch(trunk_out),
@@ -300,30 +301,39 @@ def siglip_inference(
     ripd, clip_upsample1, clip_upsample2,
     dino_decod_proj1, dino_decod_proj2,
     skip_layer_indices=(3, 7),
+    last_hidden_state=None, skips=None, student_stacked=None,
 ):
     """
     Full inference using SigLIP features instead of CLIP.
     Mirrors gs_distill_inference() but uses get_siglip_skips().
 
     Args:
-        image:        (B, 3, H, W) SigLIP-normalised.
-        text_feats:   (B, T, P, C) text embeddings from CLIP text encoder (teacher's CLIP).
-        student:      trained SigLIPStudent.
-        siglip_model: frozen SiglipModel.
-        ripd:         RIPD decoder from GSNet.
-        ...           projection modules from GSNet (same as gs_distill_inference).
+        image:              (B, 3, H, W) SigLIP-normalised.
+        text_feats:         (B, T, P, C) text embeddings from CLIP text encoder (teacher's CLIP).
+        student:            trained SigLIPStudent.
+        siglip_model:       frozen SiglipModel.
+        ripd:               RIPD decoder from GSNet.
         skip_layer_indices: SigLIP encoder layer indices for decoder skip connections.
+        last_hidden_state:  pre-computed (B, seq, C); if provided, skips SigLIP forward.
+        skips:              pre-computed skip dict {layer_idx: (B, C, H, W)}.
+        student_stacked:    pre-extracted (B, trunk_in, H_grid, W_grid) for student heads.
 
     Returns:
         logit: (B, T, H, W) segmentation logits.
     """
-    with torch.no_grad():
-        last_hidden_state, skips = get_siglip_skips(
-            siglip_model, image, list(skip_layer_indices)
-        )
-        l0, l1 = skip_layer_indices
+    if last_hidden_state is None or skips is None:
+        all_layers = sorted(set(list(skip_layer_indices) + student.siglip_layers))
+        with torch.no_grad():
+            last_hidden_state, skips = get_siglip_skips(siglip_model, image, all_layers)
+        if student_stacked is None:
+            student_stacked = torch.cat([skips[l] for l in student.siglip_layers], dim=1)
 
-    student_out = student(image)
+    l0, l1 = skip_layer_indices
+
+    if student_stacked is not None:
+        student_out = student.forward_from_features(student_stacked)
+    else:
+        student_out = student(image)
     predicted_dino_down = student_out["dino_down"]
     predicted_dino_L4 = student_out["dino_L4"]
     predicted_dino_L8 = student_out["dino_L8"]
@@ -745,13 +755,7 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
     print(f"  [Finetune] Train: {n_train}  Val: {n_val}")
 
     def _student_head_params():
-        return (
-            list(student.shared_trunk.parameters())
-            + list(student.dino_down_branch.parameters())
-            + list(student.dino_l4_branch.parameters())
-            + list(student.dino_l8_branch.parameters())
-            + list(student.clip_skip_adapters.parameters())
-        )
+        return list(student.trainable_parameters())
 
     def _decoder_proj_params():
         return [p for m in decoder_proj_modules for p in m.parameters()]
@@ -894,13 +898,20 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
                 B = images.shape[0]
                 tf = text_feats.expand(B, -1, -1, -1)
                 with autocast(enabled=args.amp):
+                    lhs_val, skips_val = get_siglip_skips(
+                        siglip_model, images, _all_siglip_layers)
+                    stacked_val = torch.cat(
+                        [skips_val[l] for l in student.siglip_layers], dim=1)
                     logit = siglip_inference(
                         image=images, text_feats=tf, student=student,
                         siglip_model=siglip_model, ripd=ripd,
                         clip_upsample1=clip_upsample1, clip_upsample2=clip_upsample2,
                         dino_decod_proj1=dino_decod_proj1, dino_decod_proj2=dino_decod_proj2,
                         skip_layer_indices=clip_skip_indices,
+                        last_hidden_state=lhs_val, skips=skips_val,
+                        student_stacked=stacked_val,
                     )
+                    del lhs_val, skips_val, stacked_val
                     logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                               mode="bilinear", align_corners=False)
                     loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx)

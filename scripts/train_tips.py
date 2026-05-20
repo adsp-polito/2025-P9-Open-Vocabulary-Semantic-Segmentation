@@ -286,9 +286,10 @@ class TIPSStudent(nn.Module):
     def forward(self, image: torch.Tensor) -> dict:
         with torch.no_grad():
             stacked = extract_tips_layers(self.tips_model, image, self.tips_layers)
+        return self.forward_from_features(stacked)
 
+    def forward_from_features(self, stacked: torch.Tensor) -> dict:
         trunk_out = self.shared_trunk(stacked)   # (B, 512, H_grid, W_grid)
-
         return {
             "dino_down": self.dino_down_branch(trunk_out),
             "dino_L4": self.dino_l4_branch(trunk_out),
@@ -318,18 +319,32 @@ def tips_inference(
     ripd, clip_upsample1, clip_upsample2,
     dino_decod_proj1, dino_decod_proj2,
     skip_layer_indices=(3, 7),
+    res3=None, skips=None, student_stacked=None,
 ):
     """
     Full inference using TIPSv2 features instead of CLIP.
     Mirrors siglip_inference() but uses get_tips_skips().
 
     res3 guidance is resized to RIPD's 24x24 feature grid.
-    """
-    with torch.no_grad():
-        res3, skips = get_tips_skips(tips_model, image, list(skip_layer_indices))
-        l0, l1 = skip_layer_indices
 
-    student_out = student(image)
+    Args:
+        res3:             pre-computed (B, C, 24, 24) last-layer patch map; if provided, skips TIPSv2 forward.
+        skips:            pre-computed skip dict {layer_idx: (B, C, H, W)}.
+        student_stacked:  pre-extracted (B, trunk_in, H_grid, W_grid) for student heads.
+    """
+    if res3 is None or skips is None:
+        all_layers = sorted(set(list(skip_layer_indices) + student.tips_layers))
+        with torch.no_grad():
+            res3, skips = get_tips_skips(tips_model, image, all_layers)
+        if student_stacked is None:
+            student_stacked = torch.cat([skips[l] for l in student.tips_layers], dim=1)
+
+    l0, l1 = skip_layer_indices
+
+    if student_stacked is not None:
+        student_out = student.forward_from_features(student_stacked)
+    else:
+        student_out = student(image)
     predicted_dino_down = student_out["dino_down"]
     predicted_dino_L4 = student_out["dino_L4"]
     predicted_dino_L8 = student_out["dino_L8"]
@@ -745,13 +760,7 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
     print(f"  [Finetune] Train: {n_train}  Val: {n_val}")
 
     def _student_head_params():
-        return (
-            list(student.shared_trunk.parameters())
-            + list(student.dino_down_branch.parameters())
-            + list(student.dino_l4_branch.parameters())
-            + list(student.dino_l8_branch.parameters())
-            + list(student.clip_skip_adapters.parameters())
-        )
+        return list(student.trainable_parameters())
 
     def _decoder_proj_params():
         return [p for m in decoder_proj_modules for p in m.parameters()]
@@ -895,13 +904,19 @@ def run_finetune(args, gsnet, student, tips_model, device, output_dir, use_wandb
                 B = images.shape[0]
                 tf = text_feats.expand(B, -1, -1, -1)
                 with autocast(enabled=args.amp):
+                    res3_val, skips_val = get_tips_skips(
+                        tips_model, images, _all_tips_layers)
+                    stacked_val = torch.cat(
+                        [skips_val[l] for l in student.tips_layers], dim=1)
                     logit = tips_inference(
                         image=images, text_feats=tf, student=student,
                         tips_model=tips_model, ripd=ripd,
                         clip_upsample1=clip_upsample1, clip_upsample2=clip_upsample2,
                         dino_decod_proj1=dino_decod_proj1, dino_decod_proj2=dino_decod_proj2,
                         skip_layer_indices=clip_skip_indices,
+                        res3=res3_val, skips=skips_val, student_stacked=stacked_val,
                     )
+                    del res3_val, skips_val, stacked_val
                     logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                               mode="bilinear", align_corners=False)
                     loss = F.cross_entropy(logit_up, labels, ignore_index=ignore_idx)

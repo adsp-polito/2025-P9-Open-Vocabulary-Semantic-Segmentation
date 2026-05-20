@@ -340,12 +340,7 @@ def main():
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     def _student_head_params():
-        return (
-            list(student.shared_trunk.parameters())
-            + list(student.dino_down_branch.parameters())
-            + list(student.dino_l4_branch.parameters())
-            + list(student.dino_l8_branch.parameters())
-        )
+        return list(student.trainable_parameters())
 
     def _decoder_proj_params():
         return [p for m in decoder_proj_modules for p in m.parameters()]
@@ -517,13 +512,20 @@ def main():
                 B = images.shape[0]
                 tf = text_feats.detach().expand(B, -1, -1, -1)
                 with autocast(enabled=args.amp):
+                    clip_feats_val, all_skips_val = get_clip_skips(
+                        clip_model, images, _all_clip_layers)
+                    stacked_val = torch.cat(
+                        [all_skips_val[l] for l in student.clip_layers], dim=1)
                     logit = gs_distill_inference(
                         image=images, text_feats=tf, student=student,
                         clip_model=clip_model, ripd=ripd,
                         clip_upsample1=clip_upsample1, clip_upsample2=clip_upsample2,
                         dino_decod_proj1=dino_decod_proj1, dino_decod_proj2=dino_decod_proj2,
                         clip_skip_layer_indices=clip_skip_indices,
+                        clip_features=clip_feats_val, clip_skips=all_skips_val,
+                        student_clip_stacked=stacked_val,
                     )
+                    del clip_feats_val, all_skips_val, stacked_val
                     logit_up = F.interpolate(logit, size=labels.shape[-2:],
                                              mode="bilinear", align_corners=False)
                     del logit
