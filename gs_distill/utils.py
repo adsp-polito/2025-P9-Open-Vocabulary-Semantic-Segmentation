@@ -19,6 +19,42 @@ def _clip_native_res(clip_model) -> int:
     return h_grid * patch_size
 
 
+def _num_clip_layers(clip_model) -> int:
+    return len(clip_model.visual.transformer.resblocks)
+
+
+def _register_clip_hooks(clip_model, layer_indices: List[int], captured: dict) -> list:
+    """
+    Register hooks on CLIP resblocks, using a forward_pre_hook on the last block.
+
+    The GSNet CLIP fork calls resblock.forward_dense() directly on the last block
+    when dense=True, which bypasses __call__ and therefore skips forward hooks.
+    Using a pre_hook on the last block captures its *input* (= output of block N-2
+    after residual add inside block N-1), which is equivalent to what a post-hook
+    on block N-1 would give. For all other blocks, a normal post-hook is used.
+    """
+    n_layers = _num_clip_layers(clip_model)
+    hooks = []
+    for l in layer_indices:
+        block = clip_model.visual.transformer.resblocks[l]
+        if l == n_layers - 1:
+            # Last block: forward_dense() bypasses __call__, so hook the input instead.
+            def make_pre_hook(idx):
+                def pre_hook(module, args):
+                    # args[0] is the input tensor (LND)
+                    captured[idx] = args[0]
+                return pre_hook
+            h = block.register_forward_pre_hook(make_pre_hook(l))
+        else:
+            def make_hook(idx):
+                def hook(module, input, output):
+                    captured[idx] = output
+                return hook
+            h = block.register_forward_hook(make_hook(l))
+        hooks.append(h)
+    return hooks
+
+
 def extract_clip_layers(clip_model, image: torch.Tensor, layers: List[int]) -> torch.Tensor:
     """
     Extract intermediate patch features from a CLIP ViT for specified transformer block indices.
@@ -40,17 +76,10 @@ def extract_clip_layers(clip_model, image: torch.Tensor, layers: List[int]) -> t
                               mode="bilinear", align_corners=False)
 
     captured = {}
-    hooks = []
-    for l in layers:
-        def make_hook(idx):
-            def hook(module, input, output):
-                captured[idx] = output
-            return hook
-        h = clip_model.visual.transformer.resblocks[l].register_forward_hook(make_hook(l))
-        hooks.append(h)
+    hooks = _register_clip_hooks(clip_model, layers, captured)
 
     with torch.no_grad():
-        clip_model.encode_image(image, dense=True)
+        clip_model.encode_image(image, dense=False)
 
     for h in hooks:
         h.remove()
@@ -74,7 +103,7 @@ def get_clip_skips(clip_model, image: torch.Tensor, layer_indices: List[int]):
     Automatically resizes the input image to the CLIP model's native resolution.
 
     Returns:
-        clip_features: dense image features from encode_image
+        clip_features: dense image features from encode_image (B, seq_len, C)
         skips: dict mapping layer_index -> (B, C, H_grid, W_grid)
     """
     native_res = _clip_native_res(clip_model)
@@ -83,14 +112,7 @@ def get_clip_skips(clip_model, image: torch.Tensor, layer_indices: List[int]):
                               mode="bilinear", align_corners=False)
 
     captured = {}
-    hooks = []
-    for l in layer_indices:
-        def make_hook(idx):
-            def hook(module, input, output):
-                captured[idx] = output
-            return hook
-        h = clip_model.visual.transformer.resblocks[l].register_forward_hook(make_hook(l))
-        hooks.append(h)
+    hooks = _register_clip_hooks(clip_model, layer_indices, captured)
 
     with torch.no_grad():
         clip_features = clip_model.encode_image(image, dense=True)
