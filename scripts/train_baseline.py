@@ -458,11 +458,11 @@ def main():
             del clip_features, clip_skips
 
             logit = ripd(
-                clip_res3,
-                dino_down,
-                tf,
-                clip_guidance,
-                [dino_L4_proj, dino_L8_proj],
+                clip_res3.float(),
+                dino_down.float(),
+                tf.float(),
+                tuple(x.float() if x is not None else None for x in clip_guidance),
+                [x.float() if x is not None else None for x in [dino_L4_proj, dino_L8_proj]],
             )
 
             with autocast(enabled=args.amp):

@@ -352,7 +352,11 @@ def siglip_inference(
     clip_guidance = (res3, res4, res5)
     dino_guidance = [dino_L4_proj, dino_L8_proj]
 
-    logit = ripd(res3, predicted_dino_down, text_feats, clip_guidance, dino_guidance)
+    logit = ripd(
+        res3.float(), predicted_dino_down.float(), text_feats.float(),
+        tuple(x.float() if x is not None else None for x in clip_guidance),
+        [x.float() if x is not None else None for x in dino_guidance],
+    )
     return logit
 
 
@@ -850,11 +854,11 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
             clip_guidance = (res3, res4, res5)
 
             logit = ripd(
-                res3,
-                dino_down,
-                tf,
-                clip_guidance,
-                [dino_L4_proj, dino_L8_proj],
+                res3.float(),
+                dino_down.float(),
+                tf.float(),
+                tuple(x.float() if x is not None else None for x in clip_guidance),
+                [x.float() if x is not None else None for x in [dino_L4_proj, dino_L8_proj]],
             )
 
             with autocast(enabled=args.amp):

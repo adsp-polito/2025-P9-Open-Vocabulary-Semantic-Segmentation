@@ -89,6 +89,13 @@ def gs_distill_inference(
     dino_guidance = [dino_L4_proj, dino_L8_proj]
 
     # ── 4. Normal RIPD path: dynamic CLIP/DINO correlations + fusion ─────────
-    logit = ripd(clip_res3, predicted_dino_down, text_feats, clip_guidance, dino_guidance)
+    # RIPD's einsum expects Float; cast in case we're inside an autocast context.
+    logit = ripd(
+        clip_res3.float(),
+        predicted_dino_down.float(),
+        text_feats.float(),
+        tuple(x.float() if x is not None else None for x in clip_guidance),
+        [x.float() if x is not None else None for x in dino_guidance],
+    )
 
     return logit
