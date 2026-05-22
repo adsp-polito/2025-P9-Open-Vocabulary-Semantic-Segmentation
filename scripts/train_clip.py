@@ -747,6 +747,10 @@ def parse_args():
                    help="Train GSNet CLIP/DINO decoder bridge projections while keeping RIPD frozen.")
     p.add_argument("--warmup-decoder-epochs",    type=int, default=0,
                    help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
+    p.add_argument("--skip-distill",    action="store_true",
+                   help="Skip Phase 2; load --distill-ckpt directly and run Phase 3 only.")
+    p.add_argument("--distill-ckpt",    default=None,
+                   help="Path to existing distill checkpoint (used with --skip-distill).")
     p.add_argument("--amp",            action="store_true")
     p.add_argument("--device",         default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--log-interval",   type=int,   default=50)
@@ -788,19 +792,27 @@ def main():
     n_params = sum(p.numel() for p in student.trainable_parameters())
     print(f"Student trainable params: {n_params / 1e6:.2f}M")
 
-    # ── Phase 2: Distillation ─────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("Phase 2 — Online distillation (CLIP student ← GSNet teacher)")
-    print("="*60)
-    best_distill_ckpt = run_distillation(args, teacher, student, device,
-                                          args.output_dir, use_wandb)
+    if args.skip_distill:
+        distill_ckpt_path = args.distill_ckpt or os.path.join(args.output_dir, "student_distill_best.pth")
+        print(f"\nSkipping Phase 2 — loading distill checkpoint: {distill_ckpt_path}")
+        if not os.path.isfile(distill_ckpt_path):
+            print(f"[ERROR] Distill checkpoint not found: {distill_ckpt_path}"); sys.exit(1)
+        ckpt = torch.load(distill_ckpt_path, map_location=device)
+        student.load_state_dict(ckpt["student"])
+        unpatch_dino()
+    else:
+        # ── Phase 2: Distillation ─────────────────────────────────────────────
+        print("\n" + "="*60)
+        print("Phase 2 — Online distillation (CLIP student ← GSNet teacher)")
+        print("="*60)
+        best_distill_ckpt = run_distillation(args, teacher, student, device,
+                                              args.output_dir, use_wandb)
+        unpatch_dino()
 
-    unpatch_dino()
-
-    # ── Reload best distill checkpoint for Phase 3 ────────────────────────────
-    print(f"\nReloading best distill checkpoint: {best_distill_ckpt}")
-    ckpt = torch.load(best_distill_ckpt, map_location=device)
-    student.load_state_dict(ckpt["student"])
+        # ── Reload best distill checkpoint for Phase 3 ────────────────────────
+        print(f"\nReloading best distill checkpoint: {best_distill_ckpt}")
+        ckpt = torch.load(best_distill_ckpt, map_location=device)
+        student.load_state_dict(ckpt["student"])
 
     # ── Phase 3: Segmentation fine-tune ───────────────────────────────────────
     print("\n" + "="*60)
