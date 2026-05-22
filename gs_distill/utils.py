@@ -25,32 +25,31 @@ def _num_clip_layers(clip_model) -> int:
 
 def _register_clip_hooks(clip_model, layer_indices: List[int], captured: dict) -> list:
     """
-    Register hooks on CLIP resblocks, using a forward_pre_hook on the last block.
+    Register post-hooks on CLIP resblocks to capture intermediate features.
 
     The GSNet CLIP fork calls resblock.forward_dense() directly on the last block
-    when dense=True, which bypasses __call__ and therefore skips forward hooks.
-    Using a pre_hook on the last block captures its *input* (= output of block N-2
-    after residual add inside block N-1), which is equivalent to what a post-hook
-    on block N-1 would give. For all other blocks, a normal post-hook is used.
+    when dense=True, which bypasses __call__ and therefore skips both forward hooks
+    and forward_pre_hooks.  To capture features at the last layer index, we instead
+    hook block N-2 (whose output equals the input to the last block) and store it
+    under the requested last-layer index.  For all other layers, a normal post-hook
+    is used.
     """
     n_layers = _num_clip_layers(clip_model)
     hooks = []
     for l in layer_indices:
-        block = clip_model.visual.transformer.resblocks[l]
         if l == n_layers - 1:
-            # Last block: forward_dense() bypasses __call__, so hook the input instead.
-            def make_pre_hook(idx):
-                def pre_hook(module, args):
-                    # args[0] is the input tensor (LND)
-                    captured[idx] = args[0]
-                return pre_hook
-            h = block.register_forward_pre_hook(make_pre_hook(l))
+            # forward_dense() bypasses __call__ on the last block — hook block N-2
+            # instead (its output == input to the last block).
+            hook_block = clip_model.visual.transformer.resblocks[l - 1]
         else:
-            def make_hook(idx):
-                def hook(module, input, output):
-                    captured[idx] = output
-                return hook
-            h = block.register_forward_hook(make_hook(l))
+            hook_block = clip_model.visual.transformer.resblocks[l]
+
+        def make_hook(idx):
+            def hook(module, input, output):
+                captured[idx] = output
+            return hook
+
+        h = hook_block.register_forward_hook(make_hook(l))
         hooks.append(h)
     return hooks
 
