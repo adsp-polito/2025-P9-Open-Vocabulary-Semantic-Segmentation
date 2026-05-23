@@ -52,7 +52,7 @@ if [ "$dataset" = "Potsdam" ]; then
      --dist-url "auto" \
      --eval-only \
      OUTPUT_DIR $output/eval/Potsdam \
-     MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/potsdam.json" \
+     MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/potsdam_improved.json" \
      DATASETS.TEST \(\"PotsdamSplit\"\,\) \
      TEST.SLIDING_WINDOW "True" \
      MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \
@@ -80,7 +80,7 @@ elif [ "$dataset" = "FLAIR" ]; then
      --dist-url "auto" \
      --eval-only \
      OUTPUT_DIR $output/eval/FLAIR \
-     MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/flair.json" \
+     MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/flair_improved.json" \
      DATASETS.TEST \(\"FLAIR_test\"\,\) \
      TEST.SLIDING_WINDOW "True" \
      MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \

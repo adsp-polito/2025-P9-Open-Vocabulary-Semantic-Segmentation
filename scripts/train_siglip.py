@@ -9,7 +9,7 @@ Key differences from the CLIP pipeline:
   - SigLIP backbone loaded via AutoModel (HuggingFace)
   - Intermediate layers hooked on vision_model.encoder.layers[l] (output: B x seq x C)
   - Image normalisation: mean=0.5, std=0.5  (SigLIP convention)
-  - Text features: SigLIP text encoder via model.get_text_features()
+  - Text features: teacher CLIP text encoder, matching the GSNet/RIPD embedding space
   - GSNet teacher still uses original CLIP — loaded from the GSNet checkpoint as usual
   - No Phase 1 attention fine-tuning required for SigLIP
 
@@ -518,7 +518,7 @@ def release_unused_gsnet(gsnet):
 
 
 def build_text_features(class_json, clip_model, device):
-    import clip as openai_clip
+    from gs_net.third_party import clip as openai_clip
     with open(class_json) as f:
         class_names = json.load(f)
     templates = ["a photo of a {}."]
@@ -729,19 +729,39 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
     dino_decod_proj1  = gsnet.dino_decod_proj1
     dino_decod_proj2  = gsnet.dino_decod_proj2
 
-    for p in ripd.parameters():
-        p.requires_grad = False
+    ripd_unfrozen         = args.unfreeze_ripd or args.warmup_decoder_epochs > 0
+    decoder_proj_unfrozen = ripd_unfrozen or args.train_decoder_projections
 
     decoder_proj_modules = [m for m in [clip_upsample1, clip_upsample2,
                                          dino_decod_proj1, dino_decod_proj2]
                              if m is not None]
-    for m in decoder_proj_modules:
-        for p in m.parameters():
-            p.requires_grad = False
 
     release_unused_gsnet(gsnet)
     gc.collect()
+
+    clip_model = clip_model.to(device)
+    ripd = ripd.to(device)
+    for m in decoder_proj_modules:
+        m.to(device)
     torch.cuda.empty_cache()
+
+    for p in ripd.parameters():
+        p.requires_grad = ripd_unfrozen
+    for m in decoder_proj_modules:
+        for p in m.parameters():
+            p.requires_grad = decoder_proj_unfrozen
+
+    warmup = args.warmup_decoder_epochs
+    if warmup > 0:
+        for p in student.parameters():
+            p.requires_grad = False
+        print(f"  RIPD decoder unfrozen. Student heads frozen for {warmup}-epoch warmup.")
+    elif ripd_unfrozen:
+        print("  RIPD unfrozen for fine-tuning.")
+    else:
+        print("  RIPD frozen; using checkpoint-loaded decoder weights.")
+    if decoder_proj_unfrozen:
+        print("  Decoder bridge projections trainable.")
 
     # Text features from teacher CLIP.
     text_feats = build_text_features(args.class_json, clip_model, device)
@@ -764,7 +784,18 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
     def _decoder_proj_params():
         return [p for m in decoder_proj_modules for p in m.parameters()]
 
-    active_params = _student_head_params()
+    if warmup > 0:
+        active_params = []
+        if ripd_unfrozen:
+            active_params += list(ripd.parameters())
+        if decoder_proj_unfrozen:
+            active_params += _decoder_proj_params()
+    else:
+        active_params = _student_head_params()
+        if ripd_unfrozen:
+            active_params += list(ripd.parameters())
+        if decoder_proj_unfrozen:
+            active_params += _decoder_proj_params()
 
     optimizer  = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
     scaler     = GradScaler(enabled=args.amp)
@@ -776,18 +807,31 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
         torch.save({
             "epoch": epoch,
             "student": student.state_dict(),
-            "ripd": None,
-            "clip_upsample1":   None,
-            "clip_upsample2":   None,
-            "dino_decod_proj1": None,
-            "dino_decod_proj2": None,
+            "ripd": ripd.state_dict() if ripd_unfrozen else None,
+            "clip_upsample1":   clip_upsample1.state_dict()  if decoder_proj_unfrozen and clip_upsample1  is not None else None,
+            "clip_upsample2":   clip_upsample2.state_dict()  if decoder_proj_unfrozen and clip_upsample2  is not None else None,
+            "dino_decod_proj1": dino_decod_proj1.state_dict() if decoder_proj_unfrozen and dino_decod_proj1 is not None else None,
+            "dino_decod_proj2": dino_decod_proj2.state_dict() if decoder_proj_unfrozen and dino_decod_proj2 is not None else None,
             "val_loss": avg_val,
             "args": vars(args),
         }, path)
 
     for epoch in range(args.finetune_epochs):
-        student.train()
-        ripd.eval()
+        if warmup > 0 and epoch == warmup:
+            for p in _student_head_params():
+                p.requires_grad = True
+            active_params = _student_head_params()
+            if ripd_unfrozen:
+                active_params += list(ripd.parameters())
+            if decoder_proj_unfrozen:
+                active_params += _decoder_proj_params()
+            optimizer = torch.optim.AdamW(active_params, lr=args.lr, weight_decay=args.weight_decay)
+            print(f"  Epoch {epoch+1}: student heads unfrozen; joint fine-tuning begins.")
+
+        student_training = (warmup == 0) or (epoch >= warmup)
+        student.train() if student_training else student.eval()
+        if ripd_unfrozen:
+            ripd.train()
 
         train_loss = 0.0
         n_train_batches = 0
@@ -892,7 +936,8 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
             del res3, res4, res5, last_hidden_state, skips, images, labels
 
         student.eval()
-        ripd.eval()
+        if ripd_unfrozen:
+            ripd.eval()
         val_loss = 0.0
         n_val_batches = 0
         with torch.no_grad():
@@ -924,13 +969,15 @@ def run_finetune(args, gsnet, student, siglip_model, device, output_dir, use_wan
 
         avg_train = train_loss / max(n_train_batches, 1)
         avg_val   = val_loss   / max(n_val_batches,   1)
-        print(f"[Finetune] Epoch {epoch+1:3d}/{args.finetune_epochs}  train={avg_train:.4f}  val={avg_val:.4f}")
+        phase     = "warmup" if (warmup > 0 and epoch < warmup) else "joint"
+        print(f"[Finetune] Epoch {epoch+1:3d}/{args.finetune_epochs}  [{phase}]  train={avg_train:.4f}  val={avg_val:.4f}")
 
         if use_wandb:
             wandb.log({
                 "finetune/epoch":      epoch + 1,
                 "finetune/train/loss": avg_train,
                 "finetune/val/loss":   avg_val,
+                "finetune/phase":      phase,
             }, step=args.distill_epochs + epoch + 1)
 
         _save(os.path.join(output_dir, "finetune_latest.pth"), epoch, avg_val)
@@ -968,6 +1015,15 @@ def parse_args():
     p.add_argument("--num-workers",     type=int,   default=4)
     p.add_argument("--grad-accum",      type=int,   default=1,
                    help="Gradient accumulation steps (effective batch = batch-size * grad-accum).")
+    p.add_argument("--unfreeze-ripd",            action="store_true")
+    p.add_argument("--train-decoder-projections", action="store_true",
+                   help="Train GSNet/SigLIP decoder bridge projections while keeping RIPD frozen.")
+    p.add_argument("--warmup-decoder-epochs",    type=int, default=0,
+                   help="Train RIPD decoder alone for N epochs, then unfreeze student heads.")
+    p.add_argument("--skip-distill",    action="store_true",
+                   help="Skip Phase 2; load --distill-ckpt directly and run Phase 3 only.")
+    p.add_argument("--distill-ckpt",    default=None,
+                   help="Path to existing distill checkpoint (used with --skip-distill).")
     p.add_argument("--amp",             action="store_true")
     p.add_argument("--device",          default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--log-interval",    type=int,   default=50)
@@ -1021,18 +1077,27 @@ def main():
     print(f"Student trainable params: {n_params / 1e6:.2f}M")
 
     # ── Phase 2: Distillation ─────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("Phase 2 — Online distillation (SigLIP student ← GSNet teacher)")
-    print("="*60)
-    best_distill_ckpt = run_distillation(args, teacher, student, device,
-                                          args.output_dir, use_wandb)
+    if args.skip_distill:
+        distill_ckpt_path = args.distill_ckpt or os.path.join(args.output_dir, "student_distill_best.pth")
+        print(f"\nSkipping Phase 2; loading distill checkpoint: {distill_ckpt_path}")
+        if not os.path.isfile(distill_ckpt_path):
+            print(f"[ERROR] Distill checkpoint not found: {distill_ckpt_path}"); sys.exit(1)
+        ckpt = torch.load(distill_ckpt_path, map_location=device)
+        student.load_state_dict(ckpt["student"])
+        unpatch_dino()
+    else:
+        print("\n" + "="*60)
+        print("Phase 2 — Online distillation (SigLIP student ← GSNet teacher)")
+        print("="*60)
+        best_distill_ckpt = run_distillation(args, teacher, student, device,
+                                              args.output_dir, use_wandb)
 
-    unpatch_dino()
+        unpatch_dino()
 
-    # ── Reload best distill checkpoint for Phase 3 ────────────────────────────
-    print(f"\nReloading best distill checkpoint: {best_distill_ckpt}")
-    ckpt = torch.load(best_distill_ckpt, map_location=device)
-    student.load_state_dict(ckpt["student"])
+        # ── Reload best distill checkpoint for Phase 3 ────────────────────────────
+        print(f"\nReloading best distill checkpoint: {best_distill_ckpt}")
+        ckpt = torch.load(best_distill_ckpt, map_location=device)
+        student.load_state_dict(ckpt["student"])
 
     # ── Phase 3: Segmentation fine-tune ───────────────────────────────────────
     print("\n" + "="*60)

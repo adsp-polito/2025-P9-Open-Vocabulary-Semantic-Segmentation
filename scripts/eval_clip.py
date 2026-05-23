@@ -60,7 +60,7 @@ DETECTRON2_DATASETS = os.environ.get("DETECTRON2_DATASETS", "gs_net/data/dataset
 
 DATASET_CONFIGS = {
     "PotsdamSplit": {
-        "class_json":   "datasets/potsdam.json",
+        "class_json":   "datasets/potsdam_improved.json",
         "ignore_label": 5,
         "image_ext":    "png",
         "gt_ext":       "png",
@@ -76,7 +76,7 @@ DATASET_CONFIGS = {
         "gt_dir":       os.path.join(DETECTRON2_DATASETS, "FloodNet", "val+test", "lbl"),
     },
     "FLAIR_test": {
-        "class_json":   "datasets/flair.json",
+        "class_json":   "datasets/flair_improved.json",
         "ignore_label": 12,
         "image_ext":    "png",
         "gt_ext":       "png",
