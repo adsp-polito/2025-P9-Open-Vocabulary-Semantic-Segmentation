@@ -128,27 +128,31 @@ def patch_ripd_capture(model):
 
 
 def patch_clip_capture(model):
-    """Monkey-patch GSNetPredictor.forward to capture raw CLIP features.
+    """Hook encode_image on the CLIP model to capture final-layer patch features.
 
-    GSNetPredictor.forward receives x=(B, 1024, 24, 24) as its first positional
-    argument — the CLIP ViT-L/14 patch feature map before QGFF/DINOv3 fusion.
-    Capturing here gives us a direct feature-level distillation target for TIPS,
-    since both models are ViT-L/14 and produce 1024-dim patch features at 24×24.
+    encode_image(dense=True) returns (B, 1+N, C) where the first token is CLS.
+    We strip CLS and reshape to (B, C, H, W) = (B, 1024, 24, 24) for ViT-L/14@336px.
+    This is the cleanest capture point — guaranteed to fire regardless of how
+    GSNetHead/GSNetPredictor route arguments internally.
     """
-    predictor = model.sem_seg_head.predictor
-    original_fwd = predictor.forward
+    clip_model = model.sem_seg_head.predictor.clip_model
+    original_encode = clip_model.encode_image
 
-    def patched_fwd(*args, **kwargs):
-        # x is the first positional arg (CLIP features)
-        x = args[0] if len(args) > 0 else kwargs.get("x", None)
-        if x is not None:
-            _captured["clip_feats"] = x.detach().cpu().half()  # (B, 1024, 24, 24)
-        return original_fwd(*args, **kwargs)
+    def patched_encode(image, dense=False):
+        result = original_encode(image, dense=dense)
+        if dense and result is not None:
+            # result: (B, 1+N, C)  where N = H*W patch tokens
+            tokens = result[:, 1:, :]          # drop CLS → (B, N, C)
+            B, N, C = tokens.shape
+            H = W = int(N ** 0.5)
+            feat = tokens.permute(0, 2, 1).reshape(B, C, H, W)  # (B, C, H, W)
+            _captured["clip_feats"] = feat.detach().cpu().half()
+        return result
 
-    predictor.forward = patched_fwd
+    clip_model.encode_image = patched_encode
 
     def unpatch():
-        predictor.forward = original_fwd
+        clip_model.encode_image = original_encode
     return unpatch
 
 
@@ -269,9 +273,11 @@ def main():
             assert clip_feats is not None, (
                 "CLIP feature capture returned None — check patch_clip_capture hook."
             )
-            assert clip_feats.shape[1] == 1024 and clip_feats.shape[2] == 24, (
-                f"Unexpected clip_feats shape: {clip_feats.shape} — expected (B, 1024, 24, 24)."
+            assert clip_feats.ndim == 4 and clip_feats.shape[2] == clip_feats.shape[3], (
+                f"Unexpected clip_feats shape: {clip_feats.shape} — expected (B, C, H, H)."
             )
+            if total_saved_feats == 0 and total_skipped == 0:
+                print(f"  [first batch] clip_feats shape: {clip_feats.shape}", flush=True)
 
         for j, orig_idx in enumerate(to_process):
             stem = stems[orig_idx]

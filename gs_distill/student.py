@@ -130,11 +130,13 @@ class SpatialAdapter(nn.Module):
 class TIPSDistillStudent(nn.Module):
     """
     Args:
-        tips_dir:    path to TIPSv2-L/14 model directory.
-        num_classes: vocabulary size (40 for LD50K).
-        hidden:      LightweightDecoder hidden channels (128).
-        bottleneck:  SpatialAdapter bottleneck channels (256).
-        class_texts: class name strings; defaults to LD50K_CLASSES if None.
+        tips_dir:       path to TIPSv2-L/14 model directory.
+        num_classes:    vocabulary size (40 for LD50K).
+        hidden:         LightweightDecoder hidden channels (128).
+        bottleneck:     SpatialAdapter bottleneck channels (256).
+        class_texts:    class name strings; defaults to LD50K_CLASSES if None.
+        unfreeze_blocks: number of TIPS transformer blocks to unfreeze from the end
+                        (0 = fully frozen as in v1; 4 = v2 Phase 2; 8 = v2 Phase 3).
     """
 
     def __init__(
@@ -144,6 +146,7 @@ class TIPSDistillStudent(nn.Module):
         hidden: int = 128,
         bottleneck: int = 256,
         class_texts: list = None,
+        unfreeze_blocks: int = 0,
     ):
         super().__init__()
 
@@ -151,7 +154,15 @@ class TIPSDistillStudent(nn.Module):
         tips.eval()
         for p in tips.parameters():
             p.requires_grad = False
+
+        if unfreeze_blocks > 0:
+            total = len(tips.vision_encoder.blocks)
+            for i in range(total - unfreeze_blocks, total):
+                for p in tips.vision_encoder.blocks[i].parameters():
+                    p.requires_grad = True
+
         self.tips = tips
+        self.unfreeze_blocks = unfreeze_blocks
 
         self.adapter = SpatialAdapter(embed_dim=1024, bottleneck=bottleneck)
         self.decoder = LightweightDecoder(num_classes=num_classes, hidden=hidden)
@@ -162,33 +173,38 @@ class TIPSDistillStudent(nn.Module):
             embeds = F.normalize(embeds, dim=-1)
         self.register_buffer("text_embeds", embeds)  # (T, 1024) frozen
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
+    def forward(self, image: torch.Tensor, return_feats: bool = False):
         """
         Args:
-            image: (B, 3, H, W) in [0, 1], resized to 336×336.
+            image:       (B, 3, H, W) in [0, 1], resized to 336×336.
+            return_feats: when True, also return the L2-normalised adapter output
+                         (B, 1024, 24, 24) for feature-level distillation loss.
 
         Returns:
-            logits: (B, T, 96, 96)
+            logits (B, T, 96, 96) — always.
+            feats  (B, 1024, 24, 24) — only when return_feats=True.
         """
-        with torch.no_grad():
+        if self.unfreeze_blocks > 0:
             _, _, patch_tokens = self.tips.vision_encoder(image)
-            # patch_tokens: (B, 576, 1024)
+        else:
+            with torch.no_grad():
+                _, _, patch_tokens = self.tips.vision_encoder(image)
 
-        # ① reshape to spatial feature map
         x = rearrange(patch_tokens, "B (H W) D -> B D H W", H=24, W=24)
-
-        # ② adapter: learn DINOv3-like spatial structure
-        x = self.adapter(x)                                    # (B, 1024, 24, 24)
-
-        # ③ L2-normalise for cosine similarity
+        x = self.adapter(x)
         x = F.normalize(x, dim=1)
 
-        # ④ correlation with class text embeddings
-        corr = torch.einsum("b d h w, t d -> b t h w", x, self.text_embeds)  # (B, T, 24, 24)
+        corr = torch.einsum("b d h w, t d -> b t h w", x, self.text_embeds)
+        logits = self.decoder(corr)
 
-        # ⑤ upsample to 96×96
-        return self.decoder(corr)                              # (B, T, 96, 96)
+        if return_feats:
+            return logits, x
+        return logits
 
     def trainable_parameters(self):
-        """Adapter + decoder only — TIPS backbone excluded."""
+        """Adapter + decoder — TIPS backbone excluded (even if some blocks are unfrozen)."""
         return list(self.adapter.parameters()) + list(self.decoder.parameters())
+
+    def backbone_parameters(self):
+        """Unfrozen TIPS block parameters — for a separate lower-LR optimizer group."""
+        return [p for p in self.tips.parameters() if p.requires_grad]
