@@ -54,7 +54,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader, random_split
 from tqdm import tqdm
 
-from gs_distill.decoder_agnostic import ClassAgnosticDecoder, SpatialProjector
+from gs_distill.decoder_agnostic import ClassAgnosticDecoder, MidProjector, SpatialProjector
 
 
 # ── SpatialAdapter (inline — same architecture as Phase 2) ────────────────────
@@ -199,11 +199,12 @@ def cosine_lr(optimizer, epoch, total_epochs, base_lrs, min_lr=1e-7):
 
 # ── Epoch runner ──────────────────────────────────────────────────────────────
 
-def run_epoch(tips, adapter, projector, decoder, text_emb, loader,
-              optimizer, scaler, device, amp, tau, lam, train=True):
+def run_epoch(tips, adapter, projector, mid_projector, decoder, mid_feats,
+              text_emb, loader, optimizer, scaler, device, amp, tau, lam, train=True):
     tips.train(train)
     adapter.train(train)
     projector.train(train)
+    mid_projector.train(train)
     decoder.train(train)
     ctx = torch.enable_grad() if train else torch.no_grad()
 
@@ -221,12 +222,17 @@ def run_epoch(tips, adapter, projector, decoder, text_emb, loader,
                 optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=amp):
-                # TIPS encoder
+                # TIPS encoder — hook populates mid_feats["feat"] on the fly
                 out     = tips.encode_image(images)
                 patches = out.patch_tokens.float()         # (B, N, 1024)
                 B, N, D = patches.shape
                 H = W   = int(N ** 0.5)                    # 24
                 feats   = patches.permute(0, 2, 1).reshape(B, D, H, W)
+
+                # Mid-level skip from hooked block
+                raw_mid = mid_feats["feat"].float()        # (B, N, 1024)
+                raw_mid = raw_mid.permute(0, 2, 1).reshape(B, D, H, W)
+                mid_skip_base = mid_projector(raw_mid)     # (B, 32, 24, 24)
 
                 # SpatialAdapter + L2-normalise
                 feats = adapter(feats)                     # (B, 1024, 24, 24)
@@ -241,47 +247,47 @@ def run_epoch(tips, adapter, projector, decoder, text_emb, loader,
                     "b d h w, t d -> b t h w", feats, text_emb
                 )                                          # (B, K, 24, 24)
 
-                # Tile spatial context and concatenate with correlation maps
+                # Tile spatial context and mid_skip K times
                 spatial_tiled = (
                     spatial_ctx.unsqueeze(1)
                     .expand(-1, K, -1, -1, -1)
                     .reshape(B * K, 64, H, W)
                 )                                          # (B*K, 64, 24, 24)
+                mid_skip_tiled = (
+                    mid_skip_base.unsqueeze(1)
+                    .expand(-1, K, -1, -1, -1)
+                    .reshape(B * K, 32, H, W)
+                )                                          # (B*K, 32, 24, 24)
                 corr_flat = corr.reshape(B * K, 1, H, W)  # (B*K, 1,  24, 24)
                 dec_input = torch.cat(
                     [corr_flat, spatial_tiled], dim=1
                 )                                          # (B*K, 65, 24, 24)
 
-                # ClassAgnosticDecoder
-                out_flat = decoder(dec_input)              # (B*K, 1,  96, 96)
-                logits   = out_flat.reshape(B, K, 96, 96) # (B,   K,  96, 96)
+                # ClassAgnosticDecoder with mid-level skip
+                out_flat = decoder(dec_input, mid_skip=mid_skip_tiled)  # (B*K, 1, 96, 96)
+                logits   = out_flat.reshape(B, K, 96, 96)               # (B,   K, 96, 96)
 
                 loss, ld, lg = mixed_loss(
                     logits, teacher_logits, gt_masks, tau, lam
                 )
 
             if train:
+                all_params = (
+                    list(tips.parameters()) +
+                    list(adapter.parameters()) +
+                    list(projector.parameters()) +
+                    list(mid_projector.parameters()) +
+                    list(decoder.parameters())
+                )
                 if amp:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(
-                        list(tips.parameters()) +
-                        list(adapter.parameters()) +
-                        list(projector.parameters()) +
-                        list(decoder.parameters()),
-                        1.0,
-                    )
+                    nn.utils.clip_grad_norm_(all_params, 1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
-                    nn.utils.clip_grad_norm_(
-                        list(tips.parameters()) +
-                        list(adapter.parameters()) +
-                        list(projector.parameters()) +
-                        list(decoder.parameters()),
-                        1.0,
-                    )
+                    nn.utils.clip_grad_norm_(all_params, 1.0)
                     optimizer.step()
 
             total += loss.item()
@@ -296,7 +302,7 @@ def run_epoch(tips, adapter, projector, decoder, text_emb, loader,
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint",      default="output/distill/student_best.pth")
+    p.add_argument("--checkpoint",      default="output_v3/distill/student_best.pth")
     p.add_argument("--tips-dir",        default="checkpoints/tipsv2-l14")
     p.add_argument("--image-dir",       required=True)
     p.add_argument("--gt-dir",          required=True)
@@ -371,10 +377,18 @@ def main():
     else:
         print("  Adapter: randomly initialised (scratch baseline)")
 
-    # ── Projector + Decoder (always random init) ──────────────────────────────
-    projector = SpatialProjector(in_dim=1024, out_dim=64).to(device)
-    decoder   = ClassAgnosticDecoder(in_channels=65).to(device)
-    print("  SpatialProjector + ClassAgnosticDecoder: randomly initialised")
+    # ── Mid-level skip hook ───────────────────────────────────────────────────
+    mid_feats   = {}
+    hook_handle = tips.vision_encoder.blocks[unfreeze_from - 1].register_forward_hook(
+        lambda m, i, o: mid_feats.update({"feat": o})
+    )
+    print(f"  Forward hook registered on block {unfreeze_from - 1}")
+
+    # ── Projector + MidProjector + Decoder (always random init) ──────────────
+    projector     = SpatialProjector(in_dim=1024, out_dim=64).to(device)
+    mid_projector = MidProjector(in_dim=1024, out_dim=32).to(device)
+    decoder       = ClassAgnosticDecoder(in_channels=65, mid_channels=32).to(device)
+    print("  SpatialProjector + MidProjector + ClassAgnosticDecoder: randomly initialised")
 
     # ── Text embeddings ───────────────────────────────────────────────────────
     ld50k_classes = json.load(open("datasets/landdiscover.json"))
@@ -385,6 +399,7 @@ def main():
 
     n_head = (sum(p.numel() for p in adapter.parameters()) +
               sum(p.numel() for p in projector.parameters()) +
+              sum(p.numel() for p in mid_projector.parameters()) +
               sum(p.numel() for p in decoder.parameters()))
     print(f"  Total trainable: {(n_backbone + n_head)/1e6:.2f}M params\n")
 
@@ -429,6 +444,7 @@ def main():
              "lr": args.backbone_lr},
             {"params": (list(adapter.parameters()) +
                         list(projector.parameters()) +
+                        list(mid_projector.parameters()) +
                         list(decoder.parameters())),
              "lr": args.lr},
         ],
@@ -448,27 +464,28 @@ def main():
 
         t0 = time.time()
         tr_loss, tr_d, tr_g = run_epoch(
-            tips, adapter, projector, decoder, text_emb,
-            train_loader, optimizer, scaler, device, args.amp,
+            tips, adapter, projector, mid_projector, decoder, mid_feats,
+            text_emb, train_loader, optimizer, scaler, device, args.amp,
             args.tau, args.lam, train=True,
         )
         vl_loss, vl_d, vl_g = run_epoch(
-            tips, adapter, projector, decoder, text_emb,
-            val_loader, optimizer, scaler, device, args.amp,
+            tips, adapter, projector, mid_projector, decoder, mid_feats,
+            text_emb, val_loader, optimizer, scaler, device, args.amp,
             args.tau, args.lam, train=False,
         )
         elapsed = time.time() - t0
         is_best = vl_loss < best_val_loss
 
         ckpt_data = {
-            "epoch":     epoch,
-            "tag":       tag,
-            "tips":      tips.state_dict(),
-            "adapter":   adapter.state_dict(),
-            "projector": projector.state_dict(),
-            "decoder":   decoder.state_dict(),
-            "val_loss":  vl_loss,
-            "args":      vars(args),
+            "epoch":         epoch,
+            "tag":           tag,
+            "tips":          tips.state_dict(),
+            "adapter":       adapter.state_dict(),
+            "projector":     projector.state_dict(),
+            "mid_projector": mid_projector.state_dict(),
+            "decoder":       decoder.state_dict(),
+            "val_loss":      vl_loss,
+            "args":          vars(args),
         }
         if is_best:
             best_val_loss = vl_loss
@@ -497,6 +514,8 @@ def main():
             f"val={vl_loss:.4f}(d={vl_d:.3f} gt={vl_g:.3f})  "
             f"{'BEST' if is_best else '    '}  {elapsed:.0f}s"
         )
+
+    hook_handle.remove()
 
     # ── Save log ──────────────────────────────────────────────────────────────
     log_path = out_dir / "training_log.json"

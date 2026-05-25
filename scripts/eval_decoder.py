@@ -45,7 +45,7 @@ import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
-from gs_distill.decoder_agnostic import ClassAgnosticDecoder, SpatialProjector
+from gs_distill.decoder_agnostic import ClassAgnosticDecoder, MidProjector, SpatialProjector
 
 
 # ── Dataset configs ───────────────────────────────────────────────────────────
@@ -207,8 +207,8 @@ def load_mask(path):
 # ── Main eval loop ────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def eval_dataset(name, cfg, tips, adapter, projector, decoder,
-                 data_root, device, batch_size, resolution):
+def eval_dataset(name, cfg, tips, adapter, projector, mid_projector, decoder,
+                 mid_feats, data_root, device, batch_size, resolution):
     class_names  = cfg["classes"]
     num_classes  = len(class_names)
     ignore_label = cfg["ignore_label"]
@@ -239,12 +239,17 @@ def eval_dataset(name, cfg, tips, adapter, projector, decoder,
         B    = imgs.shape[0]
         K    = num_classes
 
-        # TIPS encoder
+        # TIPS encoder — hook populates mid_feats["feat"]
         out     = tips.encode_image(imgs)
         patches = out.patch_tokens.float()              # (B, N, 1024)
         _, N, D = patches.shape
         H = W   = int(N ** 0.5)                         # 24
         feats   = patches.permute(0, 2, 1).reshape(B, D, H, W)
+
+        # Mid-level skip from hooked block
+        raw_mid = mid_feats["feat"].float()             # (B, N, 1024)
+        raw_mid = raw_mid.permute(0, 2, 1).reshape(B, D, H, W)
+        mid_skip_base = mid_projector(raw_mid)          # (B, 32, 24, 24)
 
         # SpatialAdapter + L2-normalise
         feats = adapter(feats)
@@ -258,18 +263,23 @@ def eval_dataset(name, cfg, tips, adapter, projector, decoder,
             "b d h w, k d -> b k h w", feats, text_emb
         )                                               # (B, K, 24, 24)
 
-        # Tile + concat
+        # Tile spatial context and mid_skip K times
         spatial_tiled = (
             spatial_ctx.unsqueeze(1)
             .expand(-1, K, -1, -1, -1)
             .reshape(B * K, 64, H, W)
         )
+        mid_skip_tiled = (
+            mid_skip_base.unsqueeze(1)
+            .expand(-1, K, -1, -1, -1)
+            .reshape(B * K, 32, H, W)
+        )
         corr_flat = corr.reshape(B * K, 1, H, W)
         dec_input = torch.cat([corr_flat, spatial_tiled], dim=1)  # (B*K, 65, 24, 24)
 
-        # Decode
-        out_flat = decoder(dec_input)                   # (B*K, 1, 96, 96)
-        logits   = out_flat.reshape(B, K, 96, 96)       # (B,   K, 96, 96)
+        # Decode with mid-level skip
+        out_flat = decoder(dec_input, mid_skip=mid_skip_tiled)  # (B*K, 1, 96, 96)
+        logits   = out_flat.reshape(B, K, 96, 96)               # (B,   K, 96, 96)
 
         for j, (oh, ow) in enumerate(orig_sizes):
             logit = F.interpolate(
@@ -342,10 +352,26 @@ def main():
     projector.load_state_dict(ckpt["projector"], strict=True)
     projector.eval().to(device)
 
+    # ── Load MidProjector ─────────────────────────────────────────────────────
+    mid_projector = MidProjector(in_dim=1024, out_dim=32)
+    mid_projector.load_state_dict(ckpt["mid_projector"], strict=True)
+    mid_projector.eval().to(device)
+
     # ── Load ClassAgnosticDecoder ─────────────────────────────────────────────
-    decoder = ClassAgnosticDecoder(in_channels=65)
+    decoder = ClassAgnosticDecoder(in_channels=65, mid_channels=32)
     decoder.load_state_dict(ckpt["decoder"], strict=True)
     decoder.eval().to(device)
+
+    # ── Mid-level skip hook ───────────────────────────────────────────────────
+    train_args   = ckpt.get("args", {})
+    unfreeze_blk = train_args.get("unfreeze_blocks", 8)
+    total_blocks = len(tips.vision_encoder.blocks)
+    hook_block   = total_blocks - unfreeze_blk - 1
+    mid_feats    = {}
+    hook_handle  = tips.vision_encoder.blocks[hook_block].register_forward_hook(
+        lambda m, i, o: mid_feats.update({"feat": o})
+    )
+    print(f"Forward hook registered on block {hook_block} (unfreeze_blocks={unfreeze_blk})")
 
     print(f"All models loaded on {device}.\n")
 
@@ -357,8 +383,8 @@ def main():
             continue
         cfg    = DATASETS[name]
         result = eval_dataset(
-            name, cfg, tips, adapter, projector, decoder,
-            args.data_root, device, args.batch_size, args.resolution,
+            name, cfg, tips, adapter, projector, mid_projector, decoder,
+            mid_feats, args.data_root, device, args.batch_size, args.resolution,
         )
         summary[name] = result["miou"]
 
@@ -366,6 +392,8 @@ def main():
         with open(out_path, "w") as f:
             json.dump(result, f, indent=2)
         print(f"  Saved → {out_path}")
+
+    hook_handle.remove()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     gsnet_original = {"FloodNet": 42.63, "FAST": 16.61, "Potsdam": 45.75, "FLAIR": 20.00}
