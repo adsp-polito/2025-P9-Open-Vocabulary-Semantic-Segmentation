@@ -167,6 +167,9 @@ class GSDistillStudent2(GSDistillStudent):
         C_clip, C_dino = self._cost_volumes(clip_res3, dino_down, text_mean)
         C_fused = self.cost_head.fuse_costs(C_clip, C_dino)
 
+        if not return_intermediate:
+            del C_clip, C_dino
+
         l0, _ = clip_skip_indices
         logit = self.cost_head(
             C_fused=C_fused,
@@ -175,16 +178,17 @@ class GSDistillStudent2(GSDistillStudent):
             F_G_res4=clip_skips[l0],
             dino_L4=dino_L4,
         )
-        self.last_corr_embed = self.cost_head.last_corr_embed
+        self.last_corr_embed = self.cost_head.last_corr_embed if return_intermediate else None
+        self.last_costs = None
+
+        if not return_intermediate:
+            return logit
+
         self.last_costs = {
             "C_clip": C_clip,
             "C_dino": C_dino,
             "C_fused": C_fused,
         }
-
-        if not return_intermediate:
-            return logit
-
         return {
             "logit": logit,
             "C_clip": C_clip,

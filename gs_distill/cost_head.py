@@ -610,12 +610,14 @@ class S2CostHead(nn.Module):
         input_resolution=(24, 24),
         decoder_guidance_proj_dims=None,
         head_mode="aggregator",
+        gradient_checkpointing=False,
     ):
         super().__init__()
         if head_mode not in {"aggregator", "conv_plus_class"}:
             raise ValueError(f"Unknown head_mode: {head_mode}")
         self.hidden_dim = hidden_dim
         self.head_mode = head_mode
+        self.gradient_checkpointing = gradient_checkpointing
         self.text_guidance_proj_dim = text_guidance_proj_dim
         self.clip_text_dim = clip_text_dim
         self.input_resolution = _to_2tuple(input_resolution)
@@ -628,8 +630,10 @@ class S2CostHead(nn.Module):
                 max(4, dec_dims[0] // 4),
             )
 
-        self.conv1 = nn.Conv2d(1, hidden_dim, kernel_size=7, stride=1, padding=3)
-        self.gate = nn.Conv2d(2, 1, kernel_size=1)
+        # Embeds the 2-channel concatenated cost volume [C_clip ; C_dino] → hidden_dim.
+        # Concatenation is used instead of a learned gate to avoid early collapse where
+        # the gate learns to suppress C_dino when it carries noisy dino_down signal.
+        self.conv1 = nn.Conv2d(2, hidden_dim, kernel_size=7, stride=1, padding=3)
 
         self.appearance_proj = nn.Sequential(
             nn.Conv2d(clip_feat_dim, appearance_guidance_proj_dim, kernel_size=3, padding=1),
@@ -694,16 +698,12 @@ class S2CostHead(nn.Module):
         return x
 
     def fuse_costs(self, C_clip, C_dino):
+        """Concatenate C_clip and C_dino along the cost channel dimension → (B, T, 2, H, W)."""
         if C_clip.shape != C_dino.shape:
             raise ValueError(
                 f"C_clip and C_dino must have the same shape, got {C_clip.shape} and {C_dino.shape}"
             )
-        B, T, H, W = C_clip.shape
-        pair = torch.stack([C_clip, C_dino], dim=2)
-        pair = rearrange(pair, "B T C H W -> (B T) C H W")
-        gate = torch.sigmoid(self.gate(pair))
-        gate = rearrange(gate, "(B T) 1 H W -> B T H W", B=B, T=T)
-        return gate * C_clip + (1.0 - gate) * C_dino
+        return torch.stack([C_clip, C_dino], dim=2)   # (B, T, 2, H, W)
 
     def _text_guidance(self, E_Q):
         if E_Q.dim() == 4:
@@ -728,14 +728,17 @@ class S2CostHead(nn.Module):
     def forward(self, C_fused, E_Q, F_G_res3, F_G_res4, dino_L4):
         """
         Args:
-            C_fused: (B, T, H, W)
+            C_fused: (B, T, 2, H, W) from fuse_costs (concatenated C_clip + C_dino)
             E_Q: (B, T, C) or (B, T, P, C)
             F_G_res3: dense CLIP feature map at cost resolution
             F_G_res4: CLIP skip used by decoder stage 1
             dino_L4: Student-1 DINO-substitute skip used by decoder stage 2
         """
-        if C_fused.dim() == 4:
-            C_fused = C_fused.unsqueeze(1)
+        # corr_embed expects (B, P, T, H, W); fuse_costs returns (B, T, P, H, W)
+        if C_fused.dim() == 5:
+            C_fused = C_fused.permute(0, 2, 1, 3, 4)   # (B, T, 2, H, W) → (B, 2, T, H, W)
+        elif C_fused.dim() == 4:
+            C_fused = C_fused.unsqueeze(1)              # legacy single-channel path
         x = self.corr_embed(C_fused)
         self.last_corr_embed = x
 
@@ -747,7 +750,11 @@ class S2CostHead(nn.Module):
 
         if self.head_mode == "aggregator":
             for layer in self.layers:
-                x = layer(x, app_g, text_g)
+                if self.gradient_checkpointing and self.training:
+                    from torch.utils.checkpoint import checkpoint
+                    x = checkpoint(layer, x, app_g, text_g, use_reentrant=True)
+                else:
+                    x = layer(x, app_g, text_g)
         else:
             for block in self.conv_blocks:
                 x = block(x)
