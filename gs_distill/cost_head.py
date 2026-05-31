@@ -734,6 +734,7 @@ class S2CostHead(nn.Module):
             F_G_res4: CLIP skip used by decoder stage 1
             dino_L4: Student-1 DINO-substitute skip used by decoder stage 2
         """
+        self.last_corr_embed = None  # reset so an exception mid-forward can't leak a stale tensor
         # corr_embed expects (B, P, T, H, W); fuse_costs returns (B, T, P, H, W)
         if C_fused.dim() == 5:
             C_fused = C_fused.permute(0, 2, 1, 3, 4)   # (B, T, 2, H, W) → (B, 2, T, H, W)

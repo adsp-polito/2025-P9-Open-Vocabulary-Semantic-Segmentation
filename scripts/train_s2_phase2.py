@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Student-2 Phase 1: Decoder warm-up via response-based distillation.
+Student-2 Phase 2: Joint fine-tuning with mixed loss.
 
-Trains only the S2CostHead + projection layers against pre-cached teacher
-logits.  No live GSNet teacher or DINOv3 is needed.
+Loads the Phase 1 warm-up checkpoint and jointly trains the decoder +
+Student-1 branches (CLIP stays frozen) using:
+    L = 0.5 * L_KL(student, cached_teacher) + 0.5 * L_CE(student, GT_mask)
 
-  Input:   Student-1 distilled checkpoint  (branches already trained)
-  Targets: cache_logits/<stem>.pt  {"logits": (40,96,96) fp16}
-  Output:  output/ashie/s2/phase1/s2_phase1_best.pth
-
-Student-1 trunk / substitute branches are frozen throughout.
-CLIP is always frozen.
+No live GSNet teacher needed — distillation signal comes from pre-cached logits.
 """
 
 import sys
@@ -21,10 +17,12 @@ sys.path.insert(0, os.path.abspath("."))
 
 import argparse
 import json
-import math
 import time
 from pathlib import Path
 
+import math
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,33 +41,56 @@ from scripts.train_clip import build_text_features, build_teacher, cosine_lr, re
 # Dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
-class CachedLogitDataset(Dataset):
-    """Pairs LD50K images with pre-cached teacher logit .pt files."""
+class Phase2Dataset(Dataset):
+    """Triplets: image + cached teacher logits + GT segmentation mask."""
 
     EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
-    def __init__(self, image_dir: str, cache_dir: str, resolution: int = 384):
+    def __init__(self, image_dir, cache_dir, label_dir, resolution=384):
         self.resolution = resolution
         cache_dir = Path(cache_dir)
+        label_dir = Path(label_dir)
 
         cache_stems = {p.stem for p in cache_dir.glob("*.pt")}
+        lbl_stems = {
+            p.stem for p in label_dir.rglob("*")
+            if p.suffix.lower() in self.EXTENSIONS
+        }
+        valid_stems = cache_stems & lbl_stems
+
         self.samples = []
         for p in sorted(Path(image_dir).rglob("*")):
-            if p.suffix.lower() in self.EXTENSIONS and p.stem in cache_stems:
-                self.samples.append((str(p), str(cache_dir / (p.stem + ".pt"))))
+            if p.suffix.lower() not in self.EXTENSIONS:
+                continue
+            if p.stem not in valid_stems:
+                continue
+            lbl_path = None
+            for ext in (".png", ".jpg", ".tif", ".tiff"):
+                candidate = label_dir / (p.stem + ext)
+                if candidate.exists():
+                    lbl_path = candidate
+                    break
+            if lbl_path is None:
+                continue
+            self.samples.append((
+                str(p),
+                str(cache_dir / (p.stem + ".pt")),
+                str(lbl_path),
+            ))
 
         if not self.samples:
             raise RuntimeError(
-                f"No image/cache pairs found.\n"
+                f"No triplets found.\n"
                 f"  image_dir: {image_dir}\n"
-                f"  cache_dir: {cache_dir}"
+                f"  cache_dir: {cache_dir}\n"
+                f"  label_dir: {label_dir}"
             )
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, cache_path = self.samples[idx]
+        img_path, cache_path, lbl_path = self.samples[idx]
 
         img = Image.open(img_path).convert("RGB")
         img = TF.resize(img, (self.resolution, self.resolution))
@@ -82,60 +103,57 @@ class CachedLogitDataset(Dataset):
 
         cached = torch.load(cache_path, map_location="cpu")
         logits = cached["logits"].float()   # (40, 96, 96)
-        return img, logits
+
+        lbl = Image.open(lbl_path)
+        lbl = TF.resize(lbl, (self.resolution, self.resolution),
+                        interpolation=TF.InterpolationMode.NEAREST)
+        lbl = torch.from_numpy(np.array(lbl)).long()  # (H, W)
+
+        return img, logits, lbl
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Loss
 # ─────────────────────────────────────────────────────────────────────────────
 
-def response_distil_loss(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    tau: float = 4.0,
-) -> torch.Tensor:
-    """
-    Temperature-scaled KL divergence.
-
-    student_logits: (B, T, H, W)
-    teacher_logits: (B, T, H, W)
-    """
+def response_distil_loss(student_logits, teacher_logits, tau=4.0):
     if teacher_logits.shape[-2:] != student_logits.shape[-2:]:
         teacher_logits = F.interpolate(
             teacher_logits, size=student_logits.shape[-2:],
             mode="bilinear", align_corners=False,
         )
-
     s = student_logits.float() / tau
     t = teacher_logits.float() / tau
-
-    # KL over the class dimension (dim=1 is T)
     student_lp = F.log_softmax(s, dim=1)
     teacher_p  = F.softmax(t,  dim=1)
-    kl = F.kl_div(student_lp, teacher_p, reduction="batchmean")
-    return kl * (tau ** 2)
+    return F.kl_div(student_lp, teacher_p, reduction="batchmean") * (tau ** 2)
+
+
+def seg_loss(student_logits, labels, ignore_index=255):
+    logit_up = F.interpolate(
+        student_logits.float(), size=labels.shape[-2:],
+        mode="bilinear", align_corners=False,
+    )
+    return F.cross_entropy(logit_up, labels, ignore_index=ignore_index)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Checkpoint helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_s1_weights(student2: GSDistillStudent2, ckpt_path: str, device):
+def load_phase1_weights(student2, ckpt_path, device):
     ckpt = torch.load(ckpt_path, map_location=device)
-    # finetune checkpoint stores weights under "student"
-    state = ckpt.get("student2", ckpt.get("student", ckpt))
+    state = ckpt.get("student2", ckpt)
     missing, unexpected = student2.load_state_dict(state, strict=False)
-    cost_missing = [k for k in missing if "cost_head" in k or "cost_proj" in k]
-    other_missing = [k for k in missing if k not in cost_missing]
-    print(f"Loaded Student-1 weights from {ckpt_path}")
-    print(f"  Cost-head/proj keys randomly initialised: {len(cost_missing)}")
-    if other_missing:
-        print(f"  Other missing keys: {len(other_missing)}")
+    print(f"Loaded Phase 1 weights from {ckpt_path}")
+    if missing:
+        print(f"  Missing keys: {len(missing)}")
     if unexpected:
-        print(f"  Ignored unexpected keys: {len(unexpected)}")
+        print(f"  Unexpected keys: {len(unexpected)}")
+    return ckpt.get("val_loss", None)
 
 
-def save_ckpt(path: str, epoch: int, student2: GSDistillStudent2, val_loss: float, args):
+def save_ckpt(path, epoch, student2, val_loss, args):
     torch.save(
         {
             "epoch": epoch,
@@ -152,28 +170,17 @@ def save_ckpt(path: str, epoch: int, student2: GSDistillStudent2, val_loss: floa
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_epoch(
-    loader,
-    student2: GSDistillStudent2,
-    text_feats: torch.Tensor,
-    optimizer,
-    scaler: GradScaler,
-    device,
-    amp: bool,
-    clip_skip_indices,
-    tau: float,
-    train: bool,
-    epoch: int,
-    total_epochs: int,
-    grad_accum: int,
+    loader, student2, text_feats, optimizer, scaler,
+    device, amp, clip_skip_indices, tau, lam_distill, lam_ce,
+    train, epoch, total_epochs, grad_accum,
 ):
     student2.train(train)
-    # CLIP and branches always frozen
     student2.clip_model.eval()
-    for m in [student2.shared_trunk, student2.dino_down_branch,
-              student2.dino_l4_branch, student2.dino_l8_branch]:
-        m.eval()
+    # CLIP always frozen
+    for p in student2.clip_model.parameters():
+        p.requires_grad_(False)
 
-    total_loss = 0.0
+    total_loss = total_kl = total_ce = 0.0
     n_batches = 0
     desc = "train" if train else "val  "
     grad_ctx = torch.enable_grad() if train else torch.no_grad()
@@ -182,11 +189,12 @@ def run_epoch(
         optimizer.zero_grad(set_to_none=True)
 
     with grad_ctx:
-        for step, (images, teacher_logits) in enumerate(
+        for step, (images, teacher_logits, labels) in enumerate(
             tqdm(loader, desc=f"Epoch {epoch+1:3d}/{total_epochs} [{desc}]", leave=False)
         ):
-            images = images.to(device, non_blocking=True)
+            images         = images.to(device, non_blocking=True)
             teacher_logits = teacher_logits.to(device, non_blocking=True)
+            labels         = labels.to(device, non_blocking=True)
             B = images.shape[0]
             tf = text_feats.detach().expand(B, -1, -1, -1)
 
@@ -195,8 +203,10 @@ def run_epoch(
                     image=images,
                     text_feats=tf,
                     clip_skip_indices=clip_skip_indices,
-                )   # (B, T, H, W)
-                loss = response_distil_loss(student_logits, teacher_logits, tau=tau)
+                )
+                l_kl = response_distil_loss(student_logits, teacher_logits, tau=tau)
+                l_ce = seg_loss(student_logits, labels)
+                loss = lam_distill * l_kl + lam_ce * l_ce
                 loss_for_backward = loss / grad_accum
 
             if train:
@@ -209,16 +219,9 @@ def run_epoch(
                 if (step + 1) % grad_accum == 0 or is_last:
                     if amp:
                         scaler.unscale_(optimizer)
-                    decoder_params = [
-                        p for m in [
-                            student2.clip_cost_proj,
-                            student2.dino_cost_proj,
-                            student2.text_cost_proj,
-                            student2.cost_head,
-                        ]
-                        for p in m.parameters()
-                    ]
-                    nn.utils.clip_grad_norm_(decoder_params, 1.0)
+                    nn.utils.clip_grad_norm_(
+                        [p for g in optimizer.param_groups for p in g["params"]], 1.0
+                    )
                     if amp:
                         scaler.step(optimizer)
                         scaler.update()
@@ -226,14 +229,17 @@ def run_epoch(
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
-            total_loss += float(loss.detach().item())
-            n_batches += 1
+            total_loss += float(loss.detach())
+            total_kl   += float(l_kl.detach())
+            total_ce   += float(l_ce.detach())
+            n_batches  += 1
 
             if train and step % 1000 == 0:
-                alloc_mib = torch.cuda.memory_allocated() / 1024**2
-                print(f"\n  [MEM step={step}] {alloc_mib:.1f} MiB", flush=True)
+                alloc = torch.cuda.memory_allocated() / 1024**2
+                print(f"\n  [MEM step={step}] {alloc:.1f} MiB", flush=True)
 
-    return total_loss / max(n_batches, 1)
+    n = max(n_batches, 1)
+    return total_loss / n, total_kl / n, total_ce / n
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,57 +248,59 @@ def run_epoch(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Student-2 Phase 1: decoder warm-up from cached teacher logits."
+        description="Student-2 Phase 2: joint fine-tuning (decoder + branches)."
     )
-    p.add_argument("--gsnet-config", required=True,
-                   help="GSNet detectron2 config YAML (needed to load GSNet CLIP fork).")
-    p.add_argument("--gsnet-weights", required=True,
-                   help="GSNet checkpoint (CLIP extracted from it; rest is discarded).")
-    p.add_argument("--s1-ckpt", default="output/ashie/clip/finetune_best.pth",
-                   help="Student-1 distilled+finetuned checkpoint.")
-    p.add_argument("--image-dir", required=True,
-                   help="LD50K training images (TR_Image).")
-    p.add_argument("--cache-dir", default="cache_logits",
-                   help="Directory with pre-cached teacher logit .pt files.")
+    p.add_argument("--gsnet-config",  required=True)
+    p.add_argument("--gsnet-weights", required=True)
+    p.add_argument("--phase1-ckpt",   required=True,
+                   help="Phase 1 warm-up checkpoint to initialise from.")
+    p.add_argument("--image-dir",  required=True)
+    p.add_argument("--cache-dir",  default="cache_logits")
+    p.add_argument("--label-dir",  required=True)
     p.add_argument("--class-json", default="datasets/landdiscover.json")
-    p.add_argument("--output-dir", default="output/ashie/s2/phase1")
-    p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--lr", type=float, default=1e-4,
-                   help="Decoder learning rate.")
+    p.add_argument("--output-dir", default="output/ashie/s2/phase2")
+    p.add_argument("--epochs",       type=int,   default=20)
+    p.add_argument("--batch-size",   type=int,   default=1)
+    p.add_argument("--lr-decoder",   type=float, default=1e-4,
+                   help="LR for cost head + projection layers.")
+    p.add_argument("--lr-branches",  type=float, default=1e-5,
+                   help="LR for Student-1 substitute branches (lower — already trained).")
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--tau", type=float, default=4.0,
-                   help="Temperature for response-based distillation.")
+    p.add_argument("--tau",          type=float, default=4.0)
+    p.add_argument("--lam-distill",  type=float, default=0.5,
+                   help="Weight for KL distillation loss.")
+    p.add_argument("--lam-ce",       type=float, default=0.5,
+                   help="Weight for CE segmentation loss.")
     p.add_argument("--val-fraction", type=float, default=0.05)
-    p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--grad-accum", type=int, default=2)
-    p.add_argument("--clip-layers", type=int, nargs="+", default=[8, 16, 20, 23])
-    p.add_argument("--clip-skip-indices", type=int, nargs=2, default=[7, 15],
-                   help="CLIP layers used as decoder skip connections.")
-    p.add_argument("--head-hidden-dim", type=int, default=128,
-                   help="S2CostHead hidden dimension (default 128 = scaled up).")
-    p.add_argument("--head-num-layers", type=int, default=2,
-                   help="Number of aggregator layers (default 2).")
-    p.add_argument("--head-window-size", type=int, default=4)
-    p.add_argument("--head-pad-len", type=int, default=0)
-    p.add_argument("--head-dec-dims", type=int, nargs=2, default=[32, 16],
-                   metavar=("DIM1", "DIM2"),
-                   help="Decoder channel dims for stage1 (24→48) and stage2 (48→96).")
-    p.add_argument("--grad-ckpt", action="store_true",
-                   help="Enable gradient checkpointing in aggregator layers (reduces VRAM at ~30%% compute cost).")
+    p.add_argument("--grad-accum",   type=int,   default=4)
+    p.add_argument("--num-workers",  type=int,   default=2)
+    p.add_argument("--clip-layers",       type=int, nargs="+", default=[8, 16, 20, 23])
+    p.add_argument("--clip-skip-indices", type=int, nargs=2,   default=[7, 15])
+    p.add_argument("--head-hidden-dim",  type=int,   default=64)
+    p.add_argument("--head-num-layers",  type=int,   default=2)
+    p.add_argument("--head-window-size", type=int,   default=4)
+    p.add_argument("--head-pad-len",     type=int,   default=0)
+    p.add_argument("--head-dec-dims",    type=int,   nargs=2, default=[32, 8])
     p.add_argument("--d-dino", type=int, default=768)
-    p.add_argument("--amp", action="store_true")
+    p.add_argument("--amp",       action="store_true")
+    p.add_argument("--grad-ckpt", action="store_true",
+                   help="Enable gradient checkpointing in S2CostHead aggregator.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is not available — training requires a GPU. "
+            "Check that SLURM allocated a GPU and CUDA_VISIBLE_DEVICES is set correctly."
+        )
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Dataset ──────────────────────────────────────────────────────────────
-    full_ds = CachedLogitDataset(args.image_dir, args.cache_dir)
+    full_ds = Phase2Dataset(args.image_dir, args.cache_dir, args.label_dir)
     n_val   = max(1, int(len(full_ds) * args.val_fraction))
     n_train = len(full_ds) - n_val
     gen = torch.Generator().manual_seed(42)
@@ -306,13 +314,10 @@ def main():
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
     )
-    print(f"Dataset: {len(full_ds)} samples  train={n_train}  val={n_val}")
+    print(f"Dataset: {len(full_ds)} triplets  train={n_train}  val={n_val}")
 
-    # ── Extract CLIP from GSNet (needed for the custom dense=True extension) ──
-    # The GSNet CLIP fork supports encode_image(dense=True) for spatial features.
-    # We load the full GSNet once, pull out CLIP, then discard the rest.
-    # No teacher inference happens during training — only cached logits are used.
-    print(f"Loading GSNet to extract CLIP model from {args.gsnet_weights} ...")
+    # ── Build model (same arch as Phase 1) ───────────────────────────────────
+    print(f"Loading GSNet to extract CLIP from {args.gsnet_weights} ...")
     teacher = build_teacher(args.gsnet_config, args.gsnet_weights, str(device))
     clip_model = teacher.sem_seg_head.predictor.clip_model
     clip_model.eval()
@@ -320,10 +325,8 @@ def main():
         p.requires_grad = False
     # Remove GSNet's permanent CLIP skip hooks before nulling sem_seg_head.
     # Without this, each encode_image call appends ~2.4 MB to teacher.layers
-    # indefinitely (hooks APPEND, never overwrite), causing the observed
-    # 2.3 MiB/step GPU memory leak that OOMs after ~4 000 steps.
+    # indefinitely (hooks APPEND, never overwrite), causing a GPU memory leak.
     remove_gsnet_clip_cache_hooks(teacher)
-    # Free everything except CLIP
     teacher.dino_model = None
     teacher.backbone = None
     teacher.sem_seg_head = None
@@ -333,18 +336,14 @@ def main():
     teacher.dino_decod_proj2 = None
     del teacher
     torch.cuda.empty_cache()
-    print("GSNet loaded; CLIP extracted, rest discarded.")
-    clip_model.eval()
-    for p in clip_model.parameters():
-        p.requires_grad = False
 
     head_kwargs = {
-        "hidden_dim":              args.head_hidden_dim,
-        "num_layers":              args.head_num_layers,
-        "window_size":             args.head_window_size,
-        "pad_len":                 args.head_pad_len,
-        "gradient_checkpointing":  args.grad_ckpt,
-        "dec_dims":                tuple(args.head_dec_dims),
+        "hidden_dim":             args.head_hidden_dim,
+        "num_layers":             args.head_num_layers,
+        "window_size":            args.head_window_size,
+        "pad_len":                args.head_pad_len,
+        "gradient_checkpointing": args.grad_ckpt,
+        "dec_dims":               tuple(args.head_dec_dims),
     }
     student2 = GSDistillStudent2(
         clip_model=clip_model,
@@ -353,77 +352,83 @@ def main():
         head_kwargs=head_kwargs,
     ).to(device)
 
-    load_s1_weights(student2, args.s1_ckpt, device)
+    phase1_val_loss = load_phase1_weights(student2, args.phase1_ckpt, device)
+    print(f"Phase 1 best val loss was: {phase1_val_loss}")
 
-    # Freeze CLIP and Student-1 branches; only decoder is trainable
-    for p in student2.clip_model.parameters():
-        p.requires_grad = False
-    student2.set_student_backbone_trainable(False)
-
-    # Convert frozen CLIP to fp16: saves ~725 MB and halves CLIP's per-step
-    # intermediate allocations. Must happen after load_s1_weights (which loads
-    # fp32 CLIP weights from the checkpoint) so the conversion sticks.
-    # The GSNet CLIP fork's custom LayerNorm (model_vpt.py) casts input to
-    # float32 before calling super().forward(), so LayerNorm weights must stay
-    # fp32 to avoid a dtype mismatch — this is standard practice for ViTs.
+    # CLIP fp16 (same as Phase 1)
     clip_model.half()
     for m in clip_model.modules():
         if isinstance(m, torch.nn.LayerNorm):
             m.float()
-    mem_after = torch.cuda.memory_allocated() / 1024**2
-    print(f"CLIP converted to fp16 (LayerNorm stays fp32).  GPU allocated: {mem_after:.0f} MiB")
+
+    # ── Two param groups: decoder (higher LR) + branches (lower LR) ─────────
     decoder_params = [
         p for m in [
-            student2.clip_cost_proj,
-            student2.dino_cost_proj,
-            student2.text_cost_proj,
-            student2.cost_head,
+            student2.clip_cost_proj, student2.dino_cost_proj,
+            student2.text_cost_proj, student2.cost_head,
         ]
         for p in m.parameters()
     ]
-    for p in decoder_params:
+    branch_params = [
+        p for m in [
+            student2.shared_trunk, student2.dino_down_branch,
+            student2.dino_l4_branch, student2.dino_l8_branch,
+        ]
+        for p in m.parameters()
+    ]
+    for p in decoder_params + branch_params:
         p.requires_grad = True
 
     n_decoder = sum(p.numel() for p in decoder_params)
-    n_total   = sum(p.numel() for p in student2.parameters())
-    print(f"Student-2: {n_total/1e6:.2f}M total  |  {n_decoder/1e6:.2f}M decoder trainable")
-    print(f"Decoder config: hidden_dim={args.head_hidden_dim}  num_layers={args.head_num_layers}")
+    n_branch  = sum(p.numel() for p in branch_params)
+    print(f"Trainable: decoder={n_decoder/1e6:.2f}M  branches={n_branch/1e6:.2f}M")
 
-    # ── Text features (built once, 40-class LD50K vocabulary) ────────────────
-    text_feats = build_text_features(
-        args.class_json, clip_model, device
-    )   # (1, 40, P, C)
-    print(f"Text features: {text_feats.shape}")
+    # ── Text features ─────────────────────────────────────────────────────────
+    text_feats = build_text_features(args.class_json, clip_model, device)
 
-    # ── Optimizer ────────────────────────────────────────────────────────────
+    # ── Optimizer (two param groups) ─────────────────────────────────────────
     optimizer = torch.optim.AdamW(
-        decoder_params, lr=args.lr, weight_decay=args.weight_decay
+        [
+            {"params": decoder_params, "lr": args.lr_decoder},
+            {"params": branch_params,  "lr": args.lr_branches},
+        ],
+        weight_decay=args.weight_decay,
     )
     scaler = GradScaler(enabled=args.amp)
     clip_skip_indices = tuple(args.clip_skip_indices)
-    warmup_epochs = max(1, args.epochs // 5)
+    warmup_epochs = max(1, args.epochs // 10)
 
-    best_val = float("inf")
-    best_path   = os.path.join(args.output_dir, "s2_phase1_best.pth")
-    latest_path = os.path.join(args.output_dir, "s2_phase1_latest.pth")
+    best_val  = float("inf")
+    best_path   = os.path.join(args.output_dir, "s2_phase2_best.pth")
+    latest_path = os.path.join(args.output_dir, "s2_phase2_latest.pth")
 
-    print(f"\nPhase 1: {args.epochs} epochs  lr={args.lr:.1e}  tau={args.tau}")
-    print(f"Output: {args.output_dir}")
+    print(f"\nPhase 2: {args.epochs} epochs")
+    print(f"  lr_decoder={args.lr_decoder:.1e}  lr_branches={args.lr_branches:.1e}")
+    print(f"  loss = {args.lam_distill}×KL + {args.lam_ce}×CE  tau={args.tau}")
+    print(f"  Output: {args.output_dir}")
     print("=" * 60)
 
     for epoch in range(args.epochs):
-        lr = cosine_lr(optimizer, epoch, args.epochs, warmup_epochs, args.lr)
-        t0 = time.time()
+        # cosine schedule applied per-group to preserve the LR ratio
+        t = epoch / max(args.epochs - 1, 1)
+        warmup = min(1.0, (epoch + 1) / max(warmup_epochs, 1))
+        cosine = 0.5 * (1 + math.cos(math.pi * t))
+        scale  = warmup * cosine
+        optimizer.param_groups[0]["lr"] = args.lr_decoder  * scale
+        optimizer.param_groups[1]["lr"] = args.lr_branches * scale
 
-        train_loss = run_epoch(
+        t0 = time.time()
+        train_loss, train_kl, train_ce = run_epoch(
             train_loader, student2, text_feats, optimizer, scaler,
             device, args.amp, clip_skip_indices, args.tau,
+            args.lam_distill, args.lam_ce,
             train=True, epoch=epoch, total_epochs=args.epochs,
             grad_accum=args.grad_accum,
         )
-        val_loss = run_epoch(
+        val_loss, val_kl, val_ce = run_epoch(
             val_loader, student2, text_feats, optimizer, scaler,
             device, args.amp, clip_skip_indices, args.tau,
+            args.lam_distill, args.lam_ce,
             train=False, epoch=epoch, total_epochs=args.epochs,
             grad_accum=args.grad_accum,
         )
@@ -431,7 +436,8 @@ def main():
 
         print(
             f"Epoch {epoch+1:3d}/{args.epochs}  "
-            f"lr={lr:.2e}  train={train_loss:.4f}  val={val_loss:.4f}  "
+            f"train={train_loss:.4f} (kl={train_kl:.4f} ce={train_ce:.4f})  "
+            f"val={val_loss:.4f} (kl={val_kl:.4f} ce={val_ce:.4f})  "
             f"({elapsed:.0f}s)"
         )
 
@@ -441,7 +447,7 @@ def main():
             save_ckpt(best_path, epoch, student2, best_val, args)
             print(f"  New best val loss: {best_val:.4f}  -> {best_path}")
 
-    print(f"\nPhase 1 done. Best val loss: {best_val:.4f}")
+    print(f"\nPhase 2 done. Best val loss: {best_val:.4f}")
     print(f"Checkpoint: {best_path}")
 
 

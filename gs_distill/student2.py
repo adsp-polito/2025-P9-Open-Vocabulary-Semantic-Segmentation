@@ -137,7 +137,11 @@ class GSDistillStudent2(GSDistillStudent):
             clip_features/clip_skips/student_clip_stacked: optional cached CLIP outputs.
             return_intermediate: return a dict with costs and features for distillation.
         """
-        needed_layers = sorted(set(list(clip_skip_indices) + list(self.clip_layers)))
+        # Unpack skip indices first: only l0 is used as F_G_res4; the second
+        # index (_) is intentionally unused and must NOT be included in
+        # needed_layers — capturing it wastes ~1.2 MiB per step.
+        l0, _ = clip_skip_indices
+        needed_layers = sorted(set([l0] + list(self.clip_layers)))
         if (
             clip_features is None
             or clip_skips is None
@@ -151,7 +155,7 @@ class GSDistillStudent2(GSDistillStudent):
         if student_clip_stacked is None:
             student_clip_stacked = torch.cat(
                 [clip_skips[layer] for layer in self.clip_layers], dim=1
-            )
+            ).float()  # branches are fp32; CLIP skips may be fp16
 
         student_out = self.forward_from_features(student_clip_stacked)
         dino_down = student_out["dino_down"]
@@ -160,7 +164,7 @@ class GSDistillStudent2(GSDistillStudent):
 
         n_tokens = clip_features.shape[1] - 1
         H = W = int(n_tokens**0.5)
-        clip_res3 = rearrange(clip_features[:, 1:, :], "B (H W) C -> B C H W", H=H, W=W)
+        clip_res3 = rearrange(clip_features[:, 1:, :], "B (H W) C -> B C H W", H=H, W=W).float()
 
         B = image.shape[0]
         text_mean = self._text_mean(text_feats, B)
@@ -170,7 +174,6 @@ class GSDistillStudent2(GSDistillStudent):
         if not return_intermediate:
             del C_clip, C_dino
 
-        l0, _ = clip_skip_indices
         logit = self.cost_head(
             C_fused=C_fused,
             E_Q=text_mean,
@@ -179,6 +182,7 @@ class GSDistillStudent2(GSDistillStudent):
             dino_L4=dino_L4,
         )
         self.last_corr_embed = self.cost_head.last_corr_embed if return_intermediate else None
+        self.cost_head.last_corr_embed = None  # release immediately so backward can free it
         self.last_costs = None
 
         if not return_intermediate:
