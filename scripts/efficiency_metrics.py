@@ -500,9 +500,11 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
     add_cat_seg_config(cfg)
     cfg.merge_from_file(args.gsnet_config)
     cfg.MODEL.DEVICE = str(device)
-    # Force off: old checkpoint predates DINOv3; its RIPD weights are CLIP-only
-    # (512-dim). Enabling this would load RSIB (768-dim) and crash in correlation.
+    # Old checkpoint predates DINOv3 — disable all DINO paths so RIPD is built
+    # without DINO layers. DetectionCheckpointer will skip the unmatched keys.
     cfg.MODEL.SEM_SEG_HEAD.USE_DINO_CORR = False
+    cfg.MODEL.SEM_SEG_HEAD.DECODER_DINO_GUIDANCE_DIMS = [0, 0]
+    cfg.MODEL.SEM_SEG_HEAD.DECODER_DINO_GUIDANCE_PROJ_DIMS = [0, 0]
     cfg.freeze()
 
     gsnet = d2_build(cfg)
