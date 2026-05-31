@@ -507,9 +507,30 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
     args.gsnet_weights used in eval_clip.py / eval_baseline.py.
     ─────────────────────────────────────────────────────────────────────────
     """
-    print("[Exp 1] old_gsnet: using DUMMY model (real loader not connected)")
-    model = _DummyModel().to(device).eval()
-    return model, None
+    if args.old_gsnet_weights is None:
+        print("[Exp 1] old_gsnet: --old-gsnet-weights not provided; using DUMMY model")
+        return _DummyModel().to(device).eval(), None
+
+    import os as _os
+    _os.environ.setdefault("RSIB_CKPT", args.rsib_ckpt)
+
+    from scripts.eval_clip import build_gsnet
+
+    gsnet = build_gsnet(args.gsnet_config, args.old_gsnet_weights, str(device))
+    gsnet.eval()
+    for p in gsnet.parameters():
+        p.requires_grad = False
+
+    class _GSNetCallable(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, image, text_feats):
+            # text_feats ignored — GSNet uses its internal text_features_test
+            return self.m([{"image": image[0], "height": image.shape[-2], "width": image.shape[-1]}])
+
+    return _GSNetCallable(gsnet).to(device).eval(), None
 
 
 def _load_improved_gsnet(args: argparse.Namespace, device: torch.device):
