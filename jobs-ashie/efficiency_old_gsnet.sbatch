@@ -20,7 +20,7 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate gsnet
 
 export DETECTRON2_DATASETS='gs_net/data/datasets'
-export RSIB_CKPT='gs_net/third_party/experiments/sup_unfreeze_20260318_225917/backbone_for_gsnet/epoch_07.pth'
+# RSIB_CKPT intentionally not set: old_gsnet predates DINOv3, USE_DINO_CORR=False
 
 if [[ -f "${PROJECT_ROOT}/.env" ]]; then
     set -o allexport

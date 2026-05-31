@@ -469,17 +469,44 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
     Requires a valid Detectron2-style state dict (top-level key "model").
     A GS-Distill training checkpoint (keys: student/epoch/val_loss) will
     be caught early with a clear error message.
+
+    USE_DINO_CORR is forced to False because the old checkpoint predates
+    DINOv3/RSIB — its RIPD weights use CLIP-only (512-dim) correlation.
+    Loading it with USE_DINO_CORR=True causes a 768 vs 512 dim crash in
+    RIPD.correlation().
     """
     if args.old_gsnet_weights is None:
         print("[Exp 1] old_gsnet: --old-gsnet-weights not provided; using DUMMY model")
         return _DummyModel().to(device).eval(), None
 
-    import os as _os
-    _os.environ.setdefault("RSIB_CKPT", args.rsib_ckpt)
+    # Validate checkpoint format before handing to DetectionCheckpointer.
+    _raw = torch.load(args.old_gsnet_weights, map_location="cpu")
+    _keys = list(_raw.keys()) if isinstance(_raw, dict) else []
+    if any(k in _keys for k in ("student", "epoch", "val_loss")):
+        raise ValueError(
+            f"Checkpoint '{args.old_gsnet_weights}' looks like a GS-Distill training "
+            f"checkpoint (top-level keys: {_keys[:6]}). "
+            f"Exp 1 (old_gsnet) needs a Detectron2-format GSNet checkpoint "
+            f"(top-level key 'model'). Pass the correct path via --old-gsnet-weights."
+        )
+    del _raw
 
-    from scripts.eval_clip import build_gsnet
+    from detectron2.config import get_cfg
+    from detectron2.checkpoint import DetectionCheckpointer
+    from detectron2.modeling import build_model as d2_build
+    from gs_net import add_cat_seg_config
 
-    gsnet = build_gsnet(args.gsnet_config, args.old_gsnet_weights, str(device))
+    cfg = get_cfg()
+    add_cat_seg_config(cfg)
+    cfg.merge_from_file(args.gsnet_config)
+    cfg.MODEL.DEVICE = str(device)
+    # Force off: old checkpoint predates DINOv3; its RIPD weights are CLIP-only
+    # (512-dim). Enabling this would load RSIB (768-dim) and crash in correlation.
+    cfg.MODEL.SEM_SEG_HEAD.USE_DINO_CORR = False
+    cfg.freeze()
+
+    gsnet = d2_build(cfg)
+    DetectionCheckpointer(gsnet).load(args.old_gsnet_weights)
     gsnet.eval()
     for p in gsnet.parameters():
         p.requires_grad = False
