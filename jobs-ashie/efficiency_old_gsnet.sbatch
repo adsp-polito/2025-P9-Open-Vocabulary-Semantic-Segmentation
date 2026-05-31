@@ -28,7 +28,7 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
     set +o allexport
 fi
 
-OLD_GSNET_WEIGHTS="dinov3/vitl16-sat493m/RSIB.pth"
+OLD_GSNET_WEIGHTS="gs_net_base/GSNet_base.pth"
 
 if [[ ! -f "${OLD_GSNET_WEIGHTS}" ]]; then
     echo "[ERROR] Old GSNet checkpoint not found: ${OLD_GSNET_WEIGHTS}"; exit 1
