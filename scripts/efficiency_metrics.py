@@ -465,47 +465,10 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
         callable_model(image, text_feats) -> logit (B, T, H, W)
         dummy_input_override: None  (use default shapes)
 
-    TODO: CONNECT MODEL — Experiment 1 (old_gsnet)
-    ─────────────────────────────────────────────────────
-    When the old GSNet checkpoint is available, replace the block below with:
-
-        import sys, os
-        sys.path.insert(0, os.path.abspath('./detectron2'))
-        sys.path.insert(0, os.path.abspath('.'))
-
-        from detectron2.config import get_cfg
-        from detectron2.checkpoint import DetectionCheckpointer
-        from detectron2.modeling import build_model as d2_build
-        from gs_net import add_cat_seg_config
-
-        cfg = get_cfg()
-        add_cat_seg_config(cfg)
-        cfg.merge_from_file(args.gsnet_config)          # configs/vitl_336_dinov3.yaml
-        cfg.MODEL.DEVICE = str(device)
-        cfg.freeze()
-        model = d2_build(cfg)
-        DetectionCheckpointer(model).load(args.old_gsnet_weights)
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad = False
-
-        # GSNet.forward() takes Detectron2's batch-dict format; wrap it so
-        # the profiler can call model(image, text_feats):
-        def _old_gsnet_callable(image, text_feats):
-            # image: (1, 3, 384, 384) CLIP-normalised
-            # Convert to the Detectron2 input format that GSNet.forward() expects.
-            # Check GSNet.forward() in gs_net/GSNet.py for the exact dict structure.
-            # The RIPD text-conditioning path expects text_feats (1, T, P, C).
-            raise NotImplementedError(
-                "Wire up the Detectron2 input dict format for old GSNet here."
-            )
-
-        return _old_gsnet_callable, None
-
-    NOTE: old_gsnet is also the source of the RIPD + decoder bridge weights
-    that Experiments 3 and 4 load.  Make sure the checkpoint path matches
-    args.gsnet_weights used in eval_clip.py / eval_baseline.py.
-    ─────────────────────────────────────────────────────────────────────────
+    Pass --old-gsnet-weights to a Detectron2-format GSNet checkpoint.
+    Requires a valid Detectron2-style state dict (top-level key "model").
+    A GS-Distill training checkpoint (keys: student/epoch/val_loss) will
+    be caught early with a clear error message.
     """
     if args.old_gsnet_weights is None:
         print("[Exp 1] old_gsnet: --old-gsnet-weights not provided; using DUMMY model")

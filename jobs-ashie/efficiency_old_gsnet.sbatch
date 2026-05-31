@@ -48,7 +48,7 @@ nvidia-smi
 "${PYTHON}" scripts/efficiency_metrics.py \
     --experiments      old_gsnet \
     --old-gsnet-weights "${OLD_GSNET_WEIGHTS}" \
-    --gsnet-config      configs/vitl_336_dinov3.yaml \
+    --gsnet-config      configs/vitb_384.yaml \
     --output-dir        output/efficiency
 
 echo ""
