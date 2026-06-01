@@ -102,7 +102,8 @@ def load_model_s2(gsnet_config, gsnet_weights, s2_ckpt, device):
         "hidden_dim": ckpt_args.get("head_hidden_dim", 64),
         "num_layers": ckpt_args.get("head_num_layers", 1),
         "window_size": ckpt_args.get("head_window_size", 4),
-        "pad_len": ckpt_args.get("head_pad_len", 0),
+        "pad_len":     ckpt_args.get("head_pad_len", 0),
+        "dec_dims":    tuple(ckpt_args.get("head_dec_dims", [32, 16])),
     }
     student2 = GSDistillStudent2(
         clip_model=clip_model,

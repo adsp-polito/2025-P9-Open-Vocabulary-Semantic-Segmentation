@@ -29,9 +29,8 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
 fi
 
 GSNET_WEIGHTS="output/gsnet_pretrain/model_final.pth"
-S1_SOURCE="${S1_SOURCE:-distill}"  # distill | baseline
-S2_CKPT="output/ashie/s2/${S1_SOURCE}/s2_best.pth"
-S2_EVAL_DIR="output/ashie/s2/${S1_SOURCE}/eval"
+S2_CKPT="${S2_CKPT:-output/ashie/s2/phase2/s2_phase2_best.pth}"
+S2_EVAL_DIR="${S2_EVAL_DIR:-output/ashie/s2/phase2/eval}"
 
 if [[ ! -f "${S2_CKPT}" ]]; then
     echo "[ERROR] Student-2 checkpoint not found: ${S2_CKPT}"
@@ -40,7 +39,6 @@ fi
 
 echo "============================================================"
 echo "Eval - Student-2 GS-Distill on Potsdam / FloodNet / FLAIR / FAST"
-echo "  S1 source:  ${S1_SOURCE}"
 echo "  Checkpoint: ${S2_CKPT}"
 echo "  Output:     ${S2_EVAL_DIR}"
 echo "============================================================"
