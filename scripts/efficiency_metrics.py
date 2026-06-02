@@ -543,22 +543,30 @@ def _load_improved_gsnet(args: argparse.Namespace, device: torch.device):
             backbone_for_gsnet/epoch_07.pth
     Loaded via env var RSIB_CKPT (set in all .sbatch files).
 
-    TODO: CONNECT MODEL — Experiment 2 (improved_gsnet)
-    ─────────────────────────────────────────────────────
-    Same as Experiment 1 but pass args.gsnet_weights (improved checkpoint):
-
-        cfg.merge_from_file(args.gsnet_config)          # configs/vitl_336_dinov3.yaml
-        # RSIB_CKPT must be exported before calling:
-        os.environ['RSIB_CKPT'] = args.rsib_ckpt        # epoch_07.pth path
-
-        # ... same build_gsnet / wrap pattern as Exp 1 ...
-
-    Return: same callable signature as Experiment 1.
-    ─────────────────────────────────────────────────────────────────────────
+    Pass --gsnet-weights for the Detectron2-format improved GSNet checkpoint
+    and --gsnet-config configs/vitl_336_dinov3.yaml.  RSIB_CKPT must be set
+    (epoch_07.pth) so the DINOv3 backbone initialises correctly.
     """
-    print("[Exp 2] improved_gsnet: using DUMMY model (real loader not connected)")
-    model = _DummyModel().to(device).eval()
-    return model, None
+    import os as _os
+    _os.environ.setdefault("RSIB_CKPT", args.rsib_ckpt)
+
+    from scripts.eval_clip import build_gsnet
+
+    gsnet = build_gsnet(args.gsnet_config, args.gsnet_weights, str(device))
+    gsnet.eval()
+    for p in gsnet.parameters():
+        p.requires_grad = False
+
+    class _GSNetCallable(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, image, text_feats):
+            # text_feats ignored — GSNet uses its internal text_features_test
+            return self.m([{"image": image[0], "height": image.shape[-2], "width": image.shape[-1]}])
+
+    return _GSNetCallable(gsnet).to(device).eval(), None
 
 
 def _load_gs_distill(args: argparse.Namespace, device: torch.device):
