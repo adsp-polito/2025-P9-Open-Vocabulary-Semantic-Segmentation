@@ -126,6 +126,13 @@ def response_distil_loss(student_logits, teacher_logits, tau=4.0):
     t = teacher_logits.float() / tau
     student_lp = F.log_softmax(s, dim=1)
     teacher_p  = F.softmax(t,  dim=1)
+    # Per-pixel mean KL (sum over classes, mean over B*H*W positions) so the
+    # distillation loss is on the SAME scale as the per-pixel CE loss. The old
+    # reduction="batchmean" divided only by batch (=1), turning KL into a near-sum
+    # over ~368k positions (~1570) that dwarfed CE (~4.6) ~340x — CE never learned.
+    B, T, H, W = student_lp.shape
+    student_lp = student_lp.permute(0, 2, 3, 1).reshape(-1, T)
+    teacher_p  = teacher_p.permute(0, 2, 3, 1).reshape(-1, T)
     return F.kl_div(student_lp, teacher_p, reduction="batchmean") * (tau ** 2)
 
 
