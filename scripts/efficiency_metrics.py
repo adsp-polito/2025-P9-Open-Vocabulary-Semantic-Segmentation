@@ -1264,11 +1264,16 @@ ALL_EXPERIMENTS: List[ExperimentConfig] = [
         name        = "gs_distill",
         description = "GS-Distill: CLIP student → frozen RIPD/QGFF decoder",
         loader_fn   = _load_gs_distill,
+        # vitl_336_dinov3.yaml uses ViT-L/14@336px CLIP: TEXT_GUIDANCE_DIM=768,
+        # not the 512-dim default (which matches vitb_384.yaml / ViT-B-16).
+        # RIPD's correlation einsum requires text_feats channel dim == img_feats (768).
+        text_shape  = (1, 40, 1, 768),
     ),
     ExperimentConfig(
         name        = "gs_distill_new_decoder",
         description = "GS-Distill: CLIP student → new lightweight decoder (TBD)",
         loader_fn   = _load_gs_distill_new_decoder,
+        text_shape  = (1, 40, 1, 768),
     ),
     ExperimentConfig(
         name        = "gs_distill_s2",

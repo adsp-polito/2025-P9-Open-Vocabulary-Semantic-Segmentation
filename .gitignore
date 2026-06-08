@@ -105,5 +105,6 @@ STUDENT2_PLAN.md
 GS_DISTILL_REPORT.md
 
 
-efficiency_improved_gsnet.csv
-efficiency_old_gsnet.csv
+efficiency_all_83366.out
+efficiency_all_83366.err
+efficiency_combined.csv
