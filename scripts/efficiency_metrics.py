@@ -157,7 +157,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 WARMUP_ITERS   = 10   # Iterations discarded before measurement begins
-MEASURE_ITERS  = 50   # Iterations whose wall-clock times are recorded
+MEASURE_ITERS  = 200  # Iterations whose wall-clock times are recorded
 
 # Default input shape: (B, C, H, W) — matches CLIP resize in eval_clip.py
 DEFAULT_IMAGE_SHAPE  = (1, 3, 384, 384)
