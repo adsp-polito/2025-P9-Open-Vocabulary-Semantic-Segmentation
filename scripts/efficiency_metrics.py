@@ -836,6 +836,22 @@ def _count_flops_fvcore(
         flops_obj = FlopCountAnalysis(_model, inputs)
         flops_obj.unsupported_ops_warnings(False)   # suppress per-op spam
         flops_obj.uncalled_modules_warnings(False)
+
+        # Older fvcore versions raise instead of silently zeroing activation ops
+        # (e.g. Sigmoid in ViT/DINOv3 models). Register explicit zero-cost handlers
+        # so they're counted as 0 FLOPs rather than crashing the entire count.
+        _zero_handler = lambda inputs, outputs: 0
+        for _op in (
+            "aten::sigmoid",    "aten::softmax",
+            "aten::silu",       "aten::gelu",
+            "aten::relu",       "aten::relu_",
+            "aten::hardswish",  "aten::hardsigmoid",
+        ):
+            try:
+                flops_obj._set_op_handle(_op, _zero_handler)
+            except Exception:
+                pass
+
         total = flops_obj.total()
         unsupported = flops_obj.unsupported_ops()
         if unsupported:
@@ -999,8 +1015,19 @@ def profile_model(
 
     # ── 3. Parameter count ───────────────────────────────────────────────────
     if modules_for_params is not None:
-        total_p = sum(p.numel() for m in modules_for_params for p in m.parameters())
-        train_p = sum(p.numel() for m in modules_for_params for p in m.parameters() if p.requires_grad)
+        # Deduplicate via object identity: GSDistillStudent registers clip_model
+        # as self.clip_model, so iterating [clip_model, student, ripd, ...] would
+        # count CLIP params twice without this guard.
+        _seen_ids: set = set()
+        total_p = 0
+        train_p = 0
+        for _m in modules_for_params:
+            for _p in _m.parameters():
+                if id(_p) not in _seen_ids:
+                    _seen_ids.add(id(_p))
+                    total_p += _p.numel()
+                    if _p.requires_grad:
+                        train_p += _p.numel()
     else:
         total_p, train_p = count_params(callable_model)
     print(f"  Params: {total_p:,} total, {train_p:,} trainable")

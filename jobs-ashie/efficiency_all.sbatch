@@ -86,6 +86,39 @@ echo "------------------------------------------------------------"
 
 echo ""
 echo "============================================================"
-echo "All profiling done. Combined CSV: output/efficiency/efficiency_combined.csv"
+echo "float32 profiling done. Combined CSV: output/efficiency/efficiency_combined.csv"
+echo "============================================================"
+
+# ── fp16 (AMP) pass — same experiments, separate output dir ──────────────────
+mkdir -p output/efficiency_fp16
+
+echo ""
+echo "------------------------------------------------------------"
+echo "[fp16 pass 1/2] old_gsnet  (config: configs/vitb_384.yaml)"
+echo "------------------------------------------------------------"
+"${PYTHON}" scripts/efficiency_metrics.py \
+    --experiments       old_gsnet \
+    --old-gsnet-weights "${OLD_GSNET_WEIGHTS}" \
+    --gsnet-config      configs/vitb_384.yaml \
+    --amp \
+    --output-dir        output/efficiency_fp16
+
+echo ""
+echo "------------------------------------------------------------"
+echo "[fp16 pass 2/2] improved_gsnet + gs_distill  (config: configs/vitl_336_dinov3.yaml)"
+echo "------------------------------------------------------------"
+"${PYTHON}" scripts/efficiency_metrics.py \
+    --experiments         improved_gsnet gs_distill \
+    --gsnet-config        configs/vitl_336_dinov3.yaml \
+    --gsnet-weights       "${GSNET_WEIGHTS}" \
+    --clip-finetune-ckpt  "${CLIP_FINETUNE_CKPT}" \
+    --amp \
+    --output-dir          output/efficiency_fp16
+
+echo ""
+echo "============================================================"
+echo "All profiling done."
+echo "  float32: output/efficiency/efficiency_combined.csv"
+echo "  fp16:    output/efficiency_fp16/efficiency_combined.csv"
 echo "End: $(date)"
 echo "============================================================"
