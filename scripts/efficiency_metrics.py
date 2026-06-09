@@ -156,8 +156,8 @@ except ImportError:
 # Config knobs — change these to adjust profiling thoroughness
 # ─────────────────────────────────────────────────────────────────────────────
 
-WARMUP_ITERS   = 10   # Iterations discarded before measurement begins
-MEASURE_ITERS  = 200  # Iterations whose wall-clock times are recorded
+WARMUP_ITERS   = 100   # Iterations discarded before measurement begins
+MEASURE_ITERS  = 1000  # Iterations whose wall-clock times are recorded
 
 # Default input shape: (B, C, H, W) — matches CLIP resize in eval_clip.py
 DEFAULT_IMAGE_SHAPE  = (1, 3, 384, 384)
@@ -470,10 +470,8 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
     A GS-Distill training checkpoint (keys: student/epoch/val_loss) will
     be caught early with a clear error message.
 
-    USE_DINO_CORR is forced to False because the old checkpoint predates
-    DINOv3/RSIB — its RIPD weights use CLIP-only (512-dim) correlation.
-    Loading it with USE_DINO_CORR=True causes a 768 vs 512 dim crash in
-    RIPD.correlation().
+    Pass --old-rsib-ckpt to the DinoV1 RSIB backbone checkpoint.
+    Sets RSIB_CKPT env var before building so the DINO branch loads correctly.
     """
     if args.old_gsnet_weights is None:
         print("[Exp 1] old_gsnet: --old-gsnet-weights not provided; using DUMMY model")
@@ -491,6 +489,9 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
         )
     del _raw
 
+    import os as _os
+    _os.environ["RSIB_CKPT"] = args.old_rsib_ckpt
+
     from detectron2.config import get_cfg
     from detectron2.checkpoint import DetectionCheckpointer
     from detectron2.modeling import build_model as d2_build
@@ -500,11 +501,6 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
     add_cat_seg_config(cfg)
     cfg.merge_from_file(args.gsnet_config)
     cfg.MODEL.DEVICE = str(device)
-    # Old checkpoint predates DINOv3 — disable all DINO paths so RIPD is built
-    # without DINO layers. DetectionCheckpointer will skip the unmatched keys.
-    cfg.MODEL.SEM_SEG_HEAD.USE_DINO_CORR = False
-    cfg.MODEL.SEM_SEG_HEAD.DECODER_DINO_GUIDANCE_DIMS = [0, 0]
-    cfg.MODEL.SEM_SEG_HEAD.DECODER_DINO_GUIDANCE_PROJ_DIMS = [0, 0]
     cfg.freeze()
 
     gsnet = d2_build(cfg)
@@ -1362,7 +1358,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gsnet-weights",       default=None,
                    help="Improved GSNet checkpoint (Exp 2; also used as teacher for Exp 3).")
     p.add_argument("--old-gsnet-weights",   default=None,
-                   help="Original (pre-DINOv3) GSNet checkpoint (Exp 1).")
+                   help="Original GSNet checkpoint (Exp 1).")
+    p.add_argument("--old-rsib-ckpt",
+                   default="DinoV1/RSIB.pth",
+                   help="DinoV1 RSIB backbone weights (Exp 1); sets RSIB_CKPT env var.")
     p.add_argument("--rsib-ckpt",           default=None,
                    help="RSIB DINOv3 backbone weights (Exp 2); sets RSIB_CKPT env var.")
     p.add_argument("--clip-finetune-ckpt",  default="output/ashie/clip/finetune_best.pth",
