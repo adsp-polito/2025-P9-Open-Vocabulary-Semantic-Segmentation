@@ -28,7 +28,7 @@ if [[ -f "${PROJECT_ROOT}/.env" ]]; then
 fi
 
 OLD_GSNET_WEIGHTS="gs_net_base/GSNet_base.pth"
-OLD_RSIB_CKPT="/nfs/home/hassan/2025-P9-Open-Vocabulary-Semantic-Segmentation/DinoV1/RSIB.pth"
+OLD_RSIB_CKPT="DinoV1/RSIB.pth"
 GSNET_WEIGHTS="output/gsnet_pretrain/model_final.pth"
 RSIB_CKPT_PATH='gs_net/third_party/experiments/sup_unfreeze_20260318_225917/backbone_for_gsnet/epoch_07.pth'
 CLIP_FINETUNE_CKPT="output/ashie/clip/finetune_best.pth"
