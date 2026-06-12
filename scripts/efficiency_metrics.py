@@ -87,9 +87,10 @@ Exp 3  gs_distill   — CLIP-conditioned student predicting DINO substitutes, wh
                       This is the GS-Distill experiment (Student-1 in the paper).
 
 Exp 4  gs_distill_new_decoder — same student DINO substitutes but RIPD/QGFF replaced
-                      by a new lightweight trainable decoder (Student-2).
-                      NOT YET IMPLEMENTED in the codebase.  The loader hook below
-                      is a placeholder; replace it once train_clip_v2.py exists.
+                      by S2CostHead, a new lightweight trainable decoder (Student-2).
+                      Forward: gs_distill_s2_inference(image, text_feats, student2,
+                        clip_model, clip_skip_layer_indices) → logit (B, T, H, W).
+                      Loaded via scripts/eval_s2.py::load_model_s2().
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HOW TO PLUG IN REAL MODELS (one-time per experiment)
@@ -156,8 +157,8 @@ except ImportError:
 # Config knobs — change these to adjust profiling thoroughness
 # ─────────────────────────────────────────────────────────────────────────────
 
-WARMUP_ITERS   = 10   # Iterations discarded before measurement begins
-MEASURE_ITERS  = 50   # Iterations whose wall-clock times are recorded
+WARMUP_ITERS   = 100   # Iterations discarded before measurement begins
+MEASURE_ITERS  = 1000  # Iterations whose wall-clock times are recorded
 
 # Default input shape: (B, C, H, W) — matches CLIP resize in eval_clip.py
 DEFAULT_IMAGE_SHAPE  = (1, 3, 384, 384)
@@ -465,51 +466,60 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
         callable_model(image, text_feats) -> logit (B, T, H, W)
         dummy_input_override: None  (use default shapes)
 
-    TODO: CONNECT MODEL — Experiment 1 (old_gsnet)
-    ─────────────────────────────────────────────────────
-    When the old GSNet checkpoint is available, replace the block below with:
+    Pass --old-gsnet-weights to a Detectron2-format GSNet checkpoint.
+    Requires a valid Detectron2-style state dict (top-level key "model").
+    A GS-Distill training checkpoint (keys: student/epoch/val_loss) will
+    be caught early with a clear error message.
 
-        import sys, os
-        sys.path.insert(0, os.path.abspath('./detectron2'))
-        sys.path.insert(0, os.path.abspath('.'))
-
-        from detectron2.config import get_cfg
-        from detectron2.checkpoint import DetectionCheckpointer
-        from detectron2.modeling import build_model as d2_build
-        from gs_net import add_cat_seg_config
-
-        cfg = get_cfg()
-        add_cat_seg_config(cfg)
-        cfg.merge_from_file(args.gsnet_config)          # configs/vitl_336_dinov3.yaml
-        cfg.MODEL.DEVICE = str(device)
-        cfg.freeze()
-        model = d2_build(cfg)
-        DetectionCheckpointer(model).load(args.old_gsnet_weights)
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad = False
-
-        # GSNet.forward() takes Detectron2's batch-dict format; wrap it so
-        # the profiler can call model(image, text_feats):
-        def _old_gsnet_callable(image, text_feats):
-            # image: (1, 3, 384, 384) CLIP-normalised
-            # Convert to the Detectron2 input format that GSNet.forward() expects.
-            # Check GSNet.forward() in gs_net/GSNet.py for the exact dict structure.
-            # The RIPD text-conditioning path expects text_feats (1, T, P, C).
-            raise NotImplementedError(
-                "Wire up the Detectron2 input dict format for old GSNet here."
-            )
-
-        return _old_gsnet_callable, None
-
-    NOTE: old_gsnet is also the source of the RIPD + decoder bridge weights
-    that Experiments 3 and 4 load.  Make sure the checkpoint path matches
-    args.gsnet_weights used in eval_clip.py / eval_baseline.py.
-    ─────────────────────────────────────────────────────────────────────────
+    Pass --old-rsib-ckpt to the DinoV1 RSIB backbone checkpoint.
+    Sets RSIB_CKPT env var before building so the DINO branch loads correctly.
     """
-    print("[Exp 1] old_gsnet: using DUMMY model (real loader not connected)")
-    model = _DummyModel().to(device).eval()
-    return model, None
+    if args.old_gsnet_weights is None:
+        print("[Exp 1] old_gsnet: --old-gsnet-weights not provided; using DUMMY model")
+        return _DummyModel().to(device).eval(), None
+
+    # Validate checkpoint format before handing to DetectionCheckpointer.
+    _raw = torch.load(args.old_gsnet_weights, map_location="cpu")
+    _keys = list(_raw.keys()) if isinstance(_raw, dict) else []
+    if any(k in _keys for k in ("student", "epoch", "val_loss")):
+        raise ValueError(
+            f"Checkpoint '{args.old_gsnet_weights}' looks like a GS-Distill training "
+            f"checkpoint (top-level keys: {_keys[:6]}). "
+            f"Exp 1 (old_gsnet) needs a Detectron2-format GSNet checkpoint "
+            f"(top-level key 'model'). Pass the correct path via --old-gsnet-weights."
+        )
+    del _raw
+
+    import os as _os
+    _os.environ["RSIB_CKPT"] = args.old_rsib_ckpt
+
+    from detectron2.config import get_cfg
+    from detectron2.checkpoint import DetectionCheckpointer
+    from detectron2.modeling import build_model as d2_build
+    from gs_net import add_cat_seg_config
+
+    cfg = get_cfg()
+    add_cat_seg_config(cfg)
+    cfg.merge_from_file(args.gsnet_config)
+    cfg.MODEL.DEVICE = str(device)
+    cfg.freeze()
+
+    gsnet = d2_build(cfg)
+    DetectionCheckpointer(gsnet).load(args.old_gsnet_weights)
+    gsnet.eval()
+    for p in gsnet.parameters():
+        p.requires_grad = False
+
+    class _GSNetCallable(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, image, text_feats):
+            # text_feats ignored — GSNet uses its internal text_features_test
+            return self.m([{"image": image[0], "height": image.shape[-2], "width": image.shape[-1]}])
+
+    return _GSNetCallable(gsnet).to(device).eval(), None
 
 
 def _load_improved_gsnet(args: argparse.Namespace, device: torch.device):
@@ -530,22 +540,30 @@ def _load_improved_gsnet(args: argparse.Namespace, device: torch.device):
             backbone_for_gsnet/epoch_07.pth
     Loaded via env var RSIB_CKPT (set in all .sbatch files).
 
-    TODO: CONNECT MODEL — Experiment 2 (improved_gsnet)
-    ─────────────────────────────────────────────────────
-    Same as Experiment 1 but pass args.gsnet_weights (improved checkpoint):
-
-        cfg.merge_from_file(args.gsnet_config)          # configs/vitl_336_dinov3.yaml
-        # RSIB_CKPT must be exported before calling:
-        os.environ['RSIB_CKPT'] = args.rsib_ckpt        # epoch_07.pth path
-
-        # ... same build_gsnet / wrap pattern as Exp 1 ...
-
-    Return: same callable signature as Experiment 1.
-    ─────────────────────────────────────────────────────────────────────────
+    Pass --gsnet-weights for the Detectron2-format improved GSNet checkpoint
+    and --gsnet-config configs/vitl_336_dinov3.yaml.  RSIB_CKPT must be set
+    (epoch_07.pth) so the DINOv3 backbone initialises correctly.
     """
-    print("[Exp 2] improved_gsnet: using DUMMY model (real loader not connected)")
-    model = _DummyModel().to(device).eval()
-    return model, None
+    import os as _os
+    _os.environ.setdefault("RSIB_CKPT", args.rsib_ckpt)
+
+    from scripts.eval_clip import build_gsnet
+
+    gsnet = build_gsnet(args.gsnet_config, args.gsnet_weights, str(device))
+    gsnet.eval()
+    for p in gsnet.parameters():
+        p.requires_grad = False
+
+    class _GSNetCallable(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, image, text_feats):
+            # text_feats ignored — GSNet uses its internal text_features_test
+            return self.m([{"image": image[0], "height": image.shape[-2], "width": image.shape[-1]}])
+
+    return _GSNetCallable(gsnet).to(device).eval(), None
 
 
 def _load_gs_distill(args: argparse.Namespace, device: torch.device):
@@ -564,49 +582,46 @@ def _load_gs_distill(args: argparse.Namespace, device: torch.device):
       2. GSDistillStudent(clip_model, ...)   → student with frozen CLIP
       3. load finetune_best.pth              → student + optionally ripd/bridges
 
-    TODO: CONNECT MODEL — Experiment 3 (gs_distill)
-    ─────────────────────────────────────────────────
-    Copy the load_model() function from scripts/eval_clip.py directly, then
-    wrap the multi-module call:
-
-        from scripts.eval_clip import load_model as load_gs_distill_model
-        from gs_distill.inference import gs_distill_inference
-
-        model_parts = load_gs_distill_model(
-            args.gsnet_config,       # configs/vitl_336_dinov3.yaml
-            args.gsnet_weights,      # output/gsnet_pretrain/model_final.pth
-            args.clip_finetune_ckpt, # output/ashie/clip/finetune_best.pth
-            device,
-        )
-
-        def _distill_callable(image, text_feats):
-            return gs_distill_inference(
-                image=image,
-                text_feats=text_feats,
-                student=model_parts["student"],
-                clip_model=model_parts["clip_model"],
-                ripd=model_parts["ripd"],
-                clip_upsample1=model_parts["clip_upsample1"],
-                clip_upsample2=model_parts["clip_upsample2"],
-                dino_decod_proj1=model_parts["dino_decod_proj1"],
-                dino_decod_proj2=model_parts["dino_decod_proj2"],
-                clip_skip_layer_indices=model_parts["clip_skip_indices"],
-            )
-
-        return _distill_callable, None
-
-    IMPORTANT: CLIP is frozen (no grad); only the student trunk, 3 branch heads,
-    and optionally RIPD are trainable.  The param counts will reflect this.
-
-    ALSO: text_feats are usually pre-computed once per dataset and reused.
-    For profiling latency we pass a fixed dummy text tensor each call, which
-    is correct — the bottleneck is the image-side forward, not text encoding.
-    Text encoding happens once outside the profiling loop in real eval.
     ─────────────────────────────────────────────────────────────────────────
     """
-    print("[Exp 3] gs_distill: using DUMMY model (real loader not connected)")
-    model = _DummyModel().to(device).eval()
-    return model, None
+    if args.clip_finetune_ckpt is None or not os.path.isfile(args.clip_finetune_ckpt):
+        print(f"[Exp 3] gs_distill: checkpoint not found ({args.clip_finetune_ckpt}); using DUMMY model")
+        return _DummyModel().to(device).eval(), None
+
+    from scripts.eval_clip import load_model as _load_gs_distill_model
+    from gs_distill.inference import gs_distill_inference
+
+    parts = _load_gs_distill_model(
+        args.gsnet_config,
+        args.gsnet_weights,
+        args.clip_finetune_ckpt,
+        device,
+    )
+
+    for module in parts.values():
+        if isinstance(module, nn.Module):
+            module.eval()
+            for p in module.parameters():
+                p.requires_grad = False
+
+    def _distill_callable(image, text_feats):
+        return gs_distill_inference(
+            image=image,
+            text_feats=text_feats,
+            student=parts["student"],
+            clip_model=parts["clip_model"],
+            ripd=parts["ripd"],
+            clip_upsample1=parts["clip_upsample1"],
+            clip_upsample2=parts["clip_upsample2"],
+            dino_decod_proj1=parts["dino_decod_proj1"],
+            dino_decod_proj2=parts["dino_decod_proj2"],
+            clip_skip_layer_indices=parts["clip_skip_indices"],
+        )
+
+    modules_for_params = [
+        m for m in parts.values() if isinstance(m, nn.Module)
+    ]
+    return _distill_callable, modules_for_params
 
 
 def _load_gs_distill_new_decoder(args: argparse.Namespace, device: torch.device):
@@ -614,35 +629,54 @@ def _load_gs_distill_new_decoder(args: argparse.Namespace, device: torch.device)
     Experiment 4 — GS-Distill with new lightweight decoder (Student-2).
 
     Same student DINO-substitute predictions as Experiment 3, but RIPD/QGFF
-    is replaced by a new trainable lightweight decoder.  This experiment does
-    NOT YET EXIST in the codebase (as of 2026-05-24).
+    is replaced by S2CostHead (gs_distill/cost_head.py), a trainable
+    lightweight cost-aggregation decoder.
 
-    When implemented:
-      - Training script:      scripts/train_clip_v2.py  (TBD)
-      - Checkpoint:           output/ashie/clip_v2/finetune_best.pth  (TBD)
-      - New decoder class:    gs_distill/decoder_v2.py  (TBD)
+    Real loading path:
+      - scripts/eval_s2.py::load_model_s2()       → builds CLIP from
+        args.gsnet_config and loads a GSDistillStudent2 checkpoint.
+      - gs_distill/inference2.py::gs_distill_s2_inference()
+        → image+text -> logit (B, T, H, W), no RIPD/QGFF/DINOv3.
 
-    TODO: CONNECT MODEL — Experiment 4 (gs_distill_new_decoder)
-    ────────────────────────────────────────────────────────────
-    Once train_clip_v2.py and the new decoder exist:
-
-        from gs_distill.student import GSDistillStudent
-        from gs_distill.decoder_v2 import LightweightDecoder  # (TBD)
-        # ... load student weights + new decoder weights ...
-        # Wrap as: callable(image, text_feats) -> logit
-
-    The input/output shapes must match Experiment 3 for a fair comparison:
-        image:      (1, 3, 384, 384)
-        text_feats: (1, T, 1, 512)
-        logit:      (1, T, 384, 384) or similar
-
-    The key efficiency question is whether removing RIPD and replacing it with
-    a lighter decoder reduces latency and memory without hurting mIoU.
+    Checkpoint resolution:
+      --new-decoder-ckpt, else --s2-ckpt, else
+      output/ashie/s2/<s1-source>/s2_best.pth (written by scripts/train_s2.py).
+      Falls back to DUMMY model if no checkpoint is found at that path.
     ─────────────────────────────────────────────────────────────────────────
     """
-    print("[Exp 4] gs_distill_new_decoder: using DUMMY model (not yet implemented)")
-    model = _DummyModel().to(device).eval()
-    return model, None
+    s2_ckpt = (
+        args.new_decoder_ckpt
+        or args.s2_ckpt
+        or os.path.join("output", "ashie", "s2", args.s1_source, "s2_best.pth")
+    )
+    if not os.path.isfile(s2_ckpt):
+        print(f"[Exp 4] gs_distill_new_decoder: checkpoint not found ({s2_ckpt}); using DUMMY model")
+        return _DummyModel().to(device).eval(), None
+
+    from scripts.eval_s2 import load_model_s2
+    from gs_distill.inference2 import gs_distill_s2_inference
+
+    parts = load_model_s2(args.gsnet_config, args.gsnet_weights, s2_ckpt, device)
+
+    for module in parts.values():
+        if isinstance(module, nn.Module):
+            module.eval()
+            for p in module.parameters():
+                p.requires_grad = False
+
+    def _s2_callable(image, text_feats):
+        return gs_distill_s2_inference(
+            image=image,
+            text_feats=text_feats,
+            student2=parts["student2"],
+            clip_model=parts["clip_model"],
+            clip_skip_layer_indices=parts["clip_skip_indices"],
+        )
+
+    modules_for_params = [
+        m for m in parts.values() if isinstance(m, nn.Module)
+    ]
+    return _s2_callable, modules_for_params
 
 
 def _load_gs_distill_s2(args: argparse.Namespace, device: torch.device):
@@ -818,6 +852,22 @@ def _count_flops_fvcore(
         flops_obj = FlopCountAnalysis(_model, inputs)
         flops_obj.unsupported_ops_warnings(False)   # suppress per-op spam
         flops_obj.uncalled_modules_warnings(False)
+
+        # Older fvcore versions raise instead of silently zeroing activation ops
+        # (e.g. Sigmoid in ViT/DINOv3 models). Register explicit zero-cost handlers
+        # so they're counted as 0 FLOPs rather than crashing the entire count.
+        _zero_handler = lambda inputs, outputs: 0
+        for _op in (
+            "aten::sigmoid",    "aten::softmax",
+            "aten::silu",       "aten::gelu",
+            "aten::relu",       "aten::relu_",
+            "aten::hardswish",  "aten::hardsigmoid",
+        ):
+            try:
+                flops_obj._set_op_handle(_op, _zero_handler)
+            except Exception:
+                pass
+
         total = flops_obj.total()
         unsupported = flops_obj.unsupported_ops()
         if unsupported:
@@ -961,7 +1011,15 @@ def profile_model(
     print(f"{'='*60}")
 
     # ── 1. Load model ────────────────────────────────────────────────────────
-    callable_model, dummy_override = config.loader_fn(args, device)
+    loader_result = config.loader_fn(args, device)
+    # loader_fn may return (callable, dummy_override) or (callable, list_of_modules)
+    callable_model, extra = loader_result
+    if isinstance(extra, list):
+        modules_for_params = extra
+        dummy_override = None
+    else:
+        modules_for_params = None
+        dummy_override = extra
 
     # ── 2. Inputs ────────────────────────────────────────────────────────────
     if dummy_override is not None:
@@ -972,7 +1030,22 @@ def profile_model(
     inputs = (img, txt)
 
     # ── 3. Parameter count ───────────────────────────────────────────────────
-    total_p, train_p = count_params(callable_model)
+    if modules_for_params is not None:
+        # Deduplicate via object identity: GSDistillStudent registers clip_model
+        # as self.clip_model, so iterating [clip_model, student, ripd, ...] would
+        # count CLIP params twice without this guard.
+        _seen_ids: set = set()
+        total_p = 0
+        train_p = 0
+        for _m in modules_for_params:
+            for _p in _m.parameters():
+                if id(_p) not in _seen_ids:
+                    _seen_ids.add(id(_p))
+                    total_p += _p.numel()
+                    if _p.requires_grad:
+                        train_p += _p.numel()
+    else:
+        total_p, train_p = count_params(callable_model)
     print(f"  Params: {total_p:,} total, {train_p:,} trainable")
 
     # ── 4. FLOPs (single forward, no grad) ───────────────────────────────────
@@ -1234,11 +1307,16 @@ ALL_EXPERIMENTS: List[ExperimentConfig] = [
         name        = "gs_distill",
         description = "GS-Distill: CLIP student → frozen RIPD/QGFF decoder",
         loader_fn   = _load_gs_distill,
+        # vitl_336_dinov3.yaml uses ViT-L/14@336px CLIP: TEXT_GUIDANCE_DIM=768,
+        # not the 512-dim default (which matches vitb_384.yaml / ViT-B-16).
+        # RIPD's correlation einsum requires text_feats channel dim == img_feats (768).
+        text_shape  = (1, 40, 1, 768),
     ),
     ExperimentConfig(
         name        = "gs_distill_new_decoder",
-        description = "GS-Distill: CLIP student → new lightweight decoder (TBD)",
+        description = "GS-Distill: CLIP student → new lightweight decoder (Student-2/S2CostHead)",
         loader_fn   = _load_gs_distill_new_decoder,
+        text_shape  = (1, 40, 1, 768),
     ),
     ExperimentConfig(
         name        = "gs_distill_s2",
@@ -1297,19 +1375,22 @@ def parse_args() -> argparse.Namespace:
     # should read them in the TODO: CONNECT MODEL functions above.
     p.add_argument("--gsnet-config",        default="configs/vitl_336_dinov3.yaml",
                    help="Detectron2 YAML config for GSNet (Exp 1 & 2).")
-    p.add_argument("--gsnet-weights",       default="output/gsnet_pretrain/model_final.pth",
+    p.add_argument("--gsnet-weights",       default=None,
                    help="Improved GSNet checkpoint (Exp 2; also used as teacher for Exp 3).")
     p.add_argument("--old-gsnet-weights",   default=None,
-                   help="Original (pre-DINOv3) GSNet checkpoint (Exp 1).")
-    p.add_argument("--rsib-ckpt",
-                   default="gs_net/third_party/experiments/sup_unfreeze_20260318_225917/backbone_for_gsnet/epoch_07.pth",
+                   help="Original GSNet checkpoint (Exp 1).")
+    p.add_argument("--old-rsib-ckpt",
+                   default="DinoV1/RSIB.pth",
+                   help="DinoV1 RSIB backbone weights (Exp 1); sets RSIB_CKPT env var.")
+    p.add_argument("--rsib-ckpt",           default=None,
                    help="RSIB DINOv3 backbone weights (Exp 2); sets RSIB_CKPT env var.")
     p.add_argument("--clip-finetune-ckpt",  default="output/ashie/clip/finetune_best.pth",
                    help="GS-Distill finetuned checkpoint (Exp 3).")
     p.add_argument("--baseline-finetune-ckpt", default="output/ashie/baseline/baseline_best.pth",
                    help="Baseline (random init) finetuned checkpoint (alternative to Exp 3).")
     p.add_argument("--new-decoder-ckpt",    default=None,
-                   help="New lightweight decoder checkpoint (Exp 4, TBD).")
+                   help="Student-2 checkpoint for gs_distill_new_decoder (Exp 4). "
+                        "Falls back to --s2-ckpt, then output/ashie/s2/<s1-source>/s2_best.pth.")
     p.add_argument("--s1-source", choices=["distill", "baseline"], default="distill",
                    help="Student-1 source used to resolve default Student-2 checkpoint path.")
     p.add_argument("--s2-ckpt",             default=None,
