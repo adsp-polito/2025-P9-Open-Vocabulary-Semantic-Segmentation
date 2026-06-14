@@ -500,7 +500,7 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
 
     cfg = get_cfg()
     add_cat_seg_config(cfg)
-    cfg.merge_from_file(args.gsnet_config)
+    cfg.merge_from_file(args.old_gsnet_config)
     cfg.MODEL.DEVICE = str(device)
     cfg.freeze()
 
@@ -1374,7 +1374,9 @@ def parse_args() -> argparse.Namespace:
     # These are currently ignored by dummy loaders.  The connecting agent
     # should read them in the TODO: CONNECT MODEL functions above.
     p.add_argument("--gsnet-config",        default="configs/vitl_336_dinov3.yaml",
-                   help="Detectron2 YAML config for GSNet (Exp 1 & 2).")
+                   help="Detectron2 YAML config for improved GSNet (Exp 2).")
+    p.add_argument("--old-gsnet-config",    default="configs/vitb_384.yaml",
+                   help="Detectron2 YAML config for old GSNet (Exp 1); uses ViT-B/8 + DinoV1.")
     p.add_argument("--gsnet-weights",       default=None,
                    help="Improved GSNet checkpoint (Exp 2; also used as teacher for Exp 3).")
     p.add_argument("--old-gsnet-weights",   default=None,
