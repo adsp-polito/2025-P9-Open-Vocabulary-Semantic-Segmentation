@@ -21,11 +21,36 @@ from detectron2.utils.memory import _ignore_torch_cuda_oom
 
 from einops import rearrange
 from .dinov3_wrapper import DINOv3Wrapper
+from .vision_transformer import vit_base
 import os
+
+
+def _extract_rsib_state_dict(checkpoint):
+    """Pull a flat param-name -> tensor dict out of a DINO-style checkpoint.
+
+    Handles the same wrapper keys as DINOv3Wrapper._extract_state_dict
+    ('model', 'state_dict', 'backbone', 'teacher') plus direct state dicts,
+    and strips 'module.'/'backbone.' prefixes.
+    """
+    if not isinstance(checkpoint, dict):
+        return None
+
+    state_dict = None
+    for key in ("model", "state_dict", "backbone", "teacher"):
+        if key in checkpoint and isinstance(checkpoint[key], dict):
+            state_dict = checkpoint[key]
+            break
+    if state_dict is None and ("pos_embed" in checkpoint or any("blocks" in k for k in checkpoint.keys())):
+        state_dict = checkpoint
+    if state_dict is None:
+        return None
+
+    return {k.replace("module.", "").replace("backbone.", ""): v for k, v in state_dict.items()}
+
 
 def BuildRSIB(Weights):
     """
-    Build Remote Sensing Image Backbone using DINOv3.
+    Build Remote Sensing Image Backbone (RSIB).
 
     According to the paper (Section 4: Dual-Stream Image Encoder - Specialist RSI Backbone):
     - Uses self-supervised pre-trained DINO for RSI domain priors
@@ -33,11 +58,20 @@ def BuildRSIB(Weights):
     - Trained on LandDiscover50K image set without labels
     - Kept frozen during training to preserve domain knowledge
 
+    Dispatches on the checkpoint's architecture:
+    - DINOv1 ViT-B/8 (patch_embed.proj.weight shape [768, 3, 8, 8]): the
+      original RSIB used by the old_gsnet baseline (configs/vitb_384.yaml,
+      e.g. DinoV1/RSIB.pth). Built via vit_base(patch_size=8) from
+      vision_transformer.py, which already produces the (B, 2305, 768)
+      get_intermediate_layers output GSNet expects.
+    - Everything else: DINOv3 ViT-L/16 (configs/vitl_336_dinov3.yaml),
+      built via DINOv3Wrapper.
+
     Args:
-        Weights: Path to DINOv3 checkpoint (ViT-L/16)
+        Weights: Path to RSIB checkpoint (DINOv1 ViT-B/8 or DINOv3 ViT-L/16)
 
     Returns:
-        DINOv3Wrapper model with pretrained weights
+        Module with pretrained weights exposing get_intermediate_layers(x, n=12)
     """
     if Weights is None:
         raise ValueError(
@@ -50,6 +84,23 @@ def BuildRSIB(Weights):
             f"Pretrained weights not found at {Weights}. Please check the file path."
         )
 
+    checkpoint = torch.load(Weights, map_location="cpu", weights_only=False)
+    state_dict = _extract_rsib_state_dict(checkpoint)
+    patch_w = state_dict.get("patch_embed.proj.weight") if state_dict else None
+
+    if patch_w is not None and tuple(patch_w.shape) == (768, 3, 8, 8):
+        print(f"Building RSIB with DINOv1 ViT-B/8 from checkpoint: {Weights}")
+        model = vit_base(patch_size=8, num_classes=0)
+        msg = model.load_state_dict(state_dict, strict=False)
+        if msg.missing_keys:
+            print(f"  Missing keys ({len(msg.missing_keys)}): {msg.missing_keys[:10]}")
+        if msg.unexpected_keys:
+            print(f"  Unexpected keys ({len(msg.unexpected_keys)}): {msg.unexpected_keys[:10]}")
+        model = model.float().eval()
+        print("✓ DINOv1 ViT-B/8 RSIB successfully built")
+        return model
+
+    del checkpoint, state_dict
     print(f"Building RSIB with DINOv3 from checkpoint: {Weights}")
     model = DINOv3Wrapper(checkpoint_path=Weights)
     model = model.float()
