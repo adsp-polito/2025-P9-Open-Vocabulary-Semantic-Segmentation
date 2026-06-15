@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 from torch.cuda.amp import autocast
+from tqdm import tqdm
 
 from detectron2.config import get_cfg
 from detectron2.data import DatasetCatalog, MetadataCatalog
@@ -114,6 +115,13 @@ def load_model_s2(gsnet_config, gsnet_weights, s2_ckpt, device):
     ).to(device)
     student2.load_state_dict(ckpt["student2"])
     student2.eval()
+
+    # Match training: CLIP fp16, LayerNorm stays fp32 to avoid dtype mismatch
+    clip_model.half()
+    for m in clip_model.modules():
+        if isinstance(m, torch.nn.LayerNorm):
+            m.float()
+
     print(
         f"  Student-2 loaded. (epoch {ckpt.get('epoch', '?')}, "
         f"val_loss {ckpt.get('val_loss', float('nan')):.4f})",
@@ -179,8 +187,8 @@ def evaluate_dataset(dataset_name, model_parts, output_dir, amp, device):
     dataset_dicts = DatasetCatalog.get(dataset_name)
     to_tensor = transforms.ToTensor()
 
-    print(f"\n[{dataset_name}] evaluating {len(dataset_dicts)} images ...")
-    for i, entry in enumerate(dataset_dicts):
+    print(f"\n[{dataset_name}] evaluating {len(dataset_dicts)} images ...", flush=True)
+    for entry in tqdm(dataset_dicts, desc=dataset_name, unit="img"):
         img_pil = Image.open(entry["file_name"]).convert("RGB")
         h, w = img_pil.size[1], img_pil.size[0]
 
@@ -208,9 +216,6 @@ def evaluate_dataset(dataset_name, model_parts, output_dir, amp, device):
             [{"file_name": entry["file_name"]}],
             [{"sem_seg": logit_up.cpu()}],
         )
-
-        if (i + 1) % 100 == 0 or (i + 1) == len(dataset_dicts):
-            print(f"  [{i+1}/{len(dataset_dicts)}]")
 
     results = evaluator.evaluate()
     miou = results["sem_seg"].get("mIoU", float("nan"))
