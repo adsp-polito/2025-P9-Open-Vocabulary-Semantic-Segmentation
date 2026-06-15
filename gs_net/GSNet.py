@@ -132,6 +132,7 @@ class GSNet(nn.Module):
         use_clip: bool,
         clip_decod_guid_dim: list,
         dino_decod_guid_dim: list,
+        text_guidance_dim: int,
     ):
         """
         Args:
@@ -206,7 +207,9 @@ class GSNet(nn.Module):
         self.dino_decod_proj1 = nn.Conv2d(in_channels = 768, out_channels=256, kernel_size=1, stride=1, padding=0) if self.dino_model and self.dino_decod_dim[0]!=0 else None
         self.dino_decod_proj2 = nn.ConvTranspose2d(in_channels= 768, out_channels=128, kernel_size=2, stride=2) if self.dino_model and self.dino_decod_dim[0]!=0 else None
         
-        self.dino_down_sample = nn.Conv2d(in_channels=768, out_channels=768, kernel_size=2, stride=2, padding=0) if self.dino_model else None
+        # out_channels must match TEXT_GUIDANCE_DIM: RIPD.correlation contracts dino_feat's
+        # channel dim against text_feats' last dim (512 for ViT-B/16, 768 for ViT-L/14@336px).
+        self.dino_down_sample = nn.Conv2d(in_channels=768, out_channels=text_guidance_dim, kernel_size=2, stride=2, padding=0) if self.dino_model else None
         self.layer_indexes = [3, 7] if clip_pretrained == "ViT-B/16" or clip_pretrained == "RemoteCLIP-ViT-B-32" else [7, 15] 
         self.layers = []
         if self.use_clip:
@@ -257,8 +260,9 @@ class GSNet(nn.Module):
             "dino": dino, 
             "use_clip":cfg.MODEL.SEM_SEG_HEAD.USE_CLIP_CORR, 
             "clip_decod_guid_dim":cfg.MODEL.SEM_SEG_HEAD.DECODER_CLIP_GUIDANCE_DIMS,
-            "dino_decod_guid_dim":cfg.MODEL.SEM_SEG_HEAD.DECODER_DINO_GUIDANCE_DIMS
-            
+            "dino_decod_guid_dim":cfg.MODEL.SEM_SEG_HEAD.DECODER_DINO_GUIDANCE_DIMS,
+            "text_guidance_dim":cfg.MODEL.SEM_SEG_HEAD.TEXT_GUIDANCE_DIM,
+
         }
 
     @property
