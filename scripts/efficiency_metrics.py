@@ -133,6 +133,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+rearrange(torch.zeros(1, 1, 1, 1), "a b c d -> a (b c) d")
+
 sys.path.insert(0, os.path.abspath("."))
 
 # fvcore is in requirements.txt (used by GSNet weight_init too)
