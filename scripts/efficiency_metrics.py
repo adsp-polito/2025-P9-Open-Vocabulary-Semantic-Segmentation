@@ -730,6 +730,15 @@ def _load_gs_distill_new_decoder(args: argparse.Namespace, device: torch.device)
 
     parts = load_model_s2(args.gsnet_config, args.gsnet_weights, s2_ckpt, device)
 
+    # load_model_s2() hard-casts CLIP to fp16 (student2.clip_model is the same
+    # module object) to mirror train_s2_phase3.py's mixed-precision setup,
+    # where the rest of the forward (e.g. S2CostHead's F_G_res4 conv) runs
+    # under autocast. The profiler instead toggles precision uniformly via
+    # --amp/autocast in _forward(), so put CLIP back in fp32 here; otherwise
+    # the float32 pass feeds fp16 CLIP skip features into fp32 cost_head
+    # convs and crashes with "Input type (c10::Half) and bias type (float)".
+    parts["clip_model"].float()
+
     for module in parts.values():
         if isinstance(module, nn.Module):
             module.eval()
