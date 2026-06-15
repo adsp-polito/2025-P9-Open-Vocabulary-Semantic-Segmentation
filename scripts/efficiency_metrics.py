@@ -121,6 +121,7 @@ import csv
 import time
 import math
 import argparse
+import traceback
 import warnings
 import gc
 from dataclasses import dataclass, field, asdict
@@ -130,6 +131,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 sys.path.insert(0, os.path.abspath("."))
 
@@ -349,6 +351,66 @@ class _S2ReplacementOnly(nn.Module):
         return self.head(C_fused, text_feats, clip_res3, clip_skip, dino_l4)
 
 
+class _GSNetFlopsWrapper:
+    """
+    FLOPs-only view of GSNet (Exp 1 & 2).
+
+    Replicates the compute of GSNet.forward()'s eval branch (CLIP image
+    encoder + DINO/RSIB backbone + sem_seg_head/RIPD) but skips
+    Detectron2's ImageList.from_tensors() / sem_seg_postprocess(). Those
+    helpers branch on torch.jit.is_tracing() and turn `image_sizes` into
+    Tensors, which fvcore's FlopCountAnalysis (a torch.jit tracer) cannot
+    get through -- it raises and _count_flops_fvcore() reports GFLOPs=NaN.
+
+    Not an nn.Module on purpose: it only holds a reference to the already-
+    built `gsnet`, so wrapping it doesn't double-count parameters when
+    attached as `callable_model.flops_model`.
+    """
+
+    def __init__(self, gsnet: nn.Module):
+        self.gsnet = gsnet
+
+    def __call__(self, image: torch.Tensor, text_feats: torch.Tensor) -> torch.Tensor:
+        m = self.gsnet
+        clip_images = (image - m.clip_pixel_mean) / m.clip_pixel_std
+        clip_images_resized = F.interpolate(
+            clip_images, size=m.clip_resolution, mode="bilinear", align_corners=False
+        )
+        dino_images_resized = F.interpolate(
+            clip_images, size=m.dino_resolution, mode="bilinear", align_corners=False
+        )
+
+        m.layers = []
+        if m.dino_model is not None:
+            dino_feat = m.dino_model.get_intermediate_layers(dino_images_resized, n=12)
+            dino_patch_feat_last_unfold = rearrange(
+                dino_feat[-1][:, 1:, :], "B (H W) C -> B C H W", H=48
+            )
+            dino_feat_down = m.dino_down_sample(dino_patch_feat_last_unfold)
+
+            dino_feat_L4 = rearrange(dino_feat[3][:, 1:, :], "B (H W) C -> B C H W", H=48)
+            dino_feat_L8 = rearrange(dino_feat[7][:, 1:, :], "B (H W) C -> B C H W", H=48)
+            dino_feat_L4_proj = m.dino_decod_proj1(dino_feat_L4) if m.dino_decod_proj1 is not None else None
+            dino_feat_L8_proj = m.dino_decod_proj2(dino_feat_L8) if m.dino_decod_proj2 is not None else None
+            dino_feat_guidance = [dino_feat_L4_proj, dino_feat_L8_proj]
+        else:
+            dino_feat_down, dino_feat_guidance = None, None
+
+        if m.use_clip:
+            clip_features = m.sem_seg_head.predictor.clip_model.encode_image(clip_images_resized, dense=True)
+            clip_image_features = clip_features[:, 1:, :]
+            res3 = rearrange(clip_image_features, "B (H W) C -> B C H W", H=24)
+            res4 = rearrange(m.layers[0][1:, :, :], "(H W) B C -> B C H W", H=24)
+            res5 = rearrange(m.layers[1][1:, :, :], "(H W) B C -> B C H W", H=24)
+            res4 = m.upsample1(res4) if m.upsample1 is not None else None
+            res5 = m.upsample2(res5) if m.upsample2 is not None else None
+            clip_features_guidance = {"res5": res5, "res4": res4, "res3": res3}
+        else:
+            clip_features, clip_features_guidance = None, None
+
+        return m.sem_seg_head(clip_features, dino_feat_down, clip_features_guidance, dino_feat_guidance)
+
+
 def _deep_update(base: dict, override: dict) -> dict:
     out = dict(base)
     for key, value in override.items():
@@ -519,7 +581,11 @@ def _load_old_gsnet(args: argparse.Namespace, device: torch.device):
             # text_feats ignored — GSNet uses its internal text_features_test
             return self.m([{"image": image[0], "height": image.shape[-2], "width": image.shape[-1]}])
 
-    return _GSNetCallable(gsnet).to(device).eval(), None
+    callable_model = _GSNetCallable(gsnet).to(device).eval()
+    # FLOPs-only path that bypasses Detectron2's ImageList/sem_seg_postprocess
+    # (see _GSNetFlopsWrapper docstring for why the full forward() can't be traced).
+    callable_model.flops_model = _GSNetFlopsWrapper(gsnet)
+    return callable_model, None
 
 
 def _load_improved_gsnet(args: argparse.Namespace, device: torch.device):
@@ -563,7 +629,11 @@ def _load_improved_gsnet(args: argparse.Namespace, device: torch.device):
             # text_feats ignored — GSNet uses its internal text_features_test
             return self.m([{"image": image[0], "height": image.shape[-2], "width": image.shape[-1]}])
 
-    return _GSNetCallable(gsnet).to(device).eval(), None
+    callable_model = _GSNetCallable(gsnet).to(device).eval()
+    # FLOPs-only path that bypasses Detectron2's ImageList/sem_seg_postprocess
+    # (see _GSNetFlopsWrapper docstring for why the full forward() can't be traced).
+    callable_model.flops_model = _GSNetFlopsWrapper(gsnet)
+    return callable_model, None
 
 
 def _load_gs_distill(args: argparse.Namespace, device: torch.device):
@@ -879,7 +949,10 @@ def _count_flops_fvcore(
             )
         return float(total)
     except Exception as e:
-        warnings.warn(f"fvcore FLOPs counting failed: {e}", RuntimeWarning, stacklevel=2)
+        warnings.warn(
+            f"fvcore FLOPs counting failed: {e}\n{traceback.format_exc()}",
+            RuntimeWarning, stacklevel=2,
+        )
         return float("nan")
 
 
@@ -1049,8 +1122,11 @@ def profile_model(
     print(f"  Params: {total_p:,} total, {train_p:,} trainable")
 
     # ── 4. FLOPs (single forward, no grad) ───────────────────────────────────
+    # Some models attach a `.flops_model` (e.g. GSNet, see _GSNetFlopsWrapper)
+    # that traces cleanly under fvcore while the real callable doesn't.
+    flops_model = getattr(callable_model, "flops_model", callable_model)
     with torch.no_grad():
-        raw_flops = count_flops(callable_model, inputs)
+        raw_flops = count_flops(flops_model, inputs)
     gflops = raw_flops / 1e9
     print(f"  GFLOPs: {gflops:.2f}" if not math.isnan(gflops) else "  GFLOPs: NaN")
 
