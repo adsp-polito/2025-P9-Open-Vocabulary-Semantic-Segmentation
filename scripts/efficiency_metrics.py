@@ -465,6 +465,187 @@ def _clip_skip_dim_from_pretrained(name: str) -> int:
     return 768 if name in {"ViT-B/16", "RemoteCLIP-ViT-B-32"} else 1024
 
 
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _time_one_forward(
+    fn: Callable,
+    device: torch.device,
+    amp: bool = False,
+) -> float:
+    _sync_if_cuda(device)
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        if amp and device.type == "cuda":
+            with torch.cuda.amp.autocast():
+                _ = fn()
+        else:
+            _ = fn()
+    _sync_if_cuda(device)
+    return (time.perf_counter() - t0) * 1000.0
+
+
+def _empty_component_metrics() -> Dict[str, float]:
+    return {
+        "component_iters": 0,
+        "component_clip_image_encoder_ms": float("nan"),
+        "component_dino_rsib_ms": float("nan"),
+        "component_ripd_qgff_ms": float("nan"),
+        "component_postprocess_ms": float("nan"),
+        "component_total_profiled_ms": float("nan"),
+    }
+
+
+def _text_embedding_policy(callable_model: Callable) -> str:
+    gsnet = getattr(callable_model, "m", None)
+    predictor = getattr(getattr(gsnet, "sem_seg_head", None), "predictor", None)
+    if predictor is not None and hasattr(predictor, "cache"):
+        return "cached_eval_text_after_cold_forward"
+    return "external_or_static_text_features"
+
+
+def _profile_gsnet_components(
+    callable_model: Callable,
+    inputs: Tuple[torch.Tensor, ...],
+    device: torch.device,
+    amp: bool,
+    iters: int,
+) -> Dict[str, float]:
+    """
+    Component timing for real GSNet wrappers only.
+
+    Stages mirror GSNet.forward()'s non-sliding eval path:
+      - CLIP image encoder + skip projections
+      - DINO/RSIB backbone + bridge projections
+      - sem_seg_head/RIPD/QGFF
+      - sigmoid + sem_seg_postprocess
+    """
+    metrics = _empty_component_metrics()
+    gsnet = getattr(callable_model, "m", None)
+    if gsnet is None or iters <= 0 or getattr(gsnet, "sliding_window", False):
+        return metrics
+
+    try:
+        from detectron2.modeling.postprocessing import sem_seg_postprocess
+        from detectron2.structures import ImageList
+    except Exception:
+        return metrics
+
+    image = inputs[0][0]
+    height = int(inputs[0].shape[-2])
+    width = int(inputs[0].shape[-1])
+
+    stage_times = {
+        "clip": [],
+        "dino": [],
+        "ripd": [],
+        "postprocess": [],
+    }
+
+    def _stage(fn: Callable) -> Tuple[object, float]:
+        _sync_if_cuda(device)
+        t0 = time.perf_counter()
+        if amp and device.type == "cuda":
+            with torch.cuda.amp.autocast():
+                out = fn()
+        else:
+            out = fn()
+        _sync_if_cuda(device)
+        return out, (time.perf_counter() - t0) * 1000.0
+
+    with torch.no_grad():
+        for _ in range(iters):
+            images = [image.to(gsnet.device)]
+            clip_images = [(x - gsnet.clip_pixel_mean) / gsnet.clip_pixel_std for x in images]
+            clip_images = ImageList.from_tensors(clip_images, gsnet.size_divisibility)
+            image_size = clip_images.image_sizes[0]
+            clip_tensor = clip_images.tensor
+
+            clip_images_resized = F.interpolate(
+                clip_tensor, size=gsnet.clip_resolution, mode="bilinear", align_corners=False
+            )
+            dino_images_resized = F.interpolate(
+                clip_tensor, size=gsnet.dino_resolution, mode="bilinear", align_corners=False
+            )
+
+            def _dino_stage():
+                if gsnet.dino_model is None:
+                    return None, None
+                dino_feat = gsnet.dino_model.get_intermediate_layers(dino_images_resized, n=12)
+                dino_patch_feat_last_unfold = rearrange(
+                    dino_feat[-1][:, 1:, :], "B (H W) C -> B C H W", H=48
+                )
+                dino_feat_down = gsnet.dino_down_sample(dino_patch_feat_last_unfold)
+                dino_feat_L4 = rearrange(dino_feat[3][:, 1:, :], "B (H W) C -> B C H W", H=48)
+                dino_feat_L8 = rearrange(dino_feat[7][:, 1:, :], "B (H W) C -> B C H W", H=48)
+                dino_feat_L4_proj = (
+                    gsnet.dino_decod_proj1(dino_feat_L4)
+                    if gsnet.dino_decod_proj1 is not None else None
+                )
+                dino_feat_L8_proj = (
+                    gsnet.dino_decod_proj2(dino_feat_L8)
+                    if gsnet.dino_decod_proj2 is not None else None
+                )
+                return dino_feat_down, [dino_feat_L4_proj, dino_feat_L8_proj]
+
+            (dino_feat_down, dino_guidance), dt = _stage(_dino_stage)
+            stage_times["dino"].append(dt)
+
+            def _clip_stage():
+                if not gsnet.use_clip:
+                    return None, None
+                gsnet.layers = []
+                clip_features = gsnet.sem_seg_head.predictor.clip_model.encode_image(
+                    clip_images_resized, dense=True
+                )
+                clip_image_features = clip_features[:, 1:, :]
+                res3 = rearrange(clip_image_features, "B (H W) C -> B C H W", H=24)
+                res4 = rearrange(gsnet.layers[0][1:, :, :], "(H W) B C -> B C H W", H=24)
+                res5 = rearrange(gsnet.layers[1][1:, :, :], "(H W) B C -> B C H W", H=24)
+                res4 = gsnet.upsample1(res4) if gsnet.upsample1 is not None else None
+                res5 = gsnet.upsample2(res5) if gsnet.upsample2 is not None else None
+                return clip_features, {"res5": res5, "res4": res4, "res3": res3}
+
+            (clip_features, clip_guidance), dt = _stage(_clip_stage)
+            stage_times["clip"].append(dt)
+
+            def _ripd_stage():
+                return gsnet.sem_seg_head(
+                    clip_features,
+                    dino_feat_down,
+                    clip_guidance,
+                    dino_guidance,
+                )
+
+            outputs, dt = _stage(_ripd_stage)
+            stage_times["ripd"].append(dt)
+
+            def _postprocess_stage():
+                out = outputs.sigmoid()
+                return sem_seg_postprocess(out[0], image_size, height, width)
+
+            _, dt = _stage(_postprocess_stage)
+            stage_times["postprocess"].append(dt)
+
+    def _mean(values: List[float]) -> float:
+        return float(torch.tensor(values).mean()) if values else float("nan")
+
+    metrics["component_iters"] = iters
+    metrics["component_clip_image_encoder_ms"] = _mean(stage_times["clip"])
+    metrics["component_dino_rsib_ms"] = _mean(stage_times["dino"])
+    metrics["component_ripd_qgff_ms"] = _mean(stage_times["ripd"])
+    metrics["component_postprocess_ms"] = _mean(stage_times["postprocess"])
+    metrics["component_total_profiled_ms"] = (
+        metrics["component_clip_image_encoder_ms"]
+        + metrics["component_dino_rsib_ms"]
+        + metrics["component_ripd_qgff_ms"]
+        + metrics["component_postprocess_ms"]
+    )
+    return metrics
+
+
 def _ripd_profile_config(args: argparse.Namespace) -> dict:
     cfg = _load_yaml_with_base(args.gsnet_config)
     sem = cfg.get("MODEL", {}).get("SEM_SEG_HEAD", {})
@@ -1050,12 +1231,14 @@ class ProfileResult:
     batch_size:          int
     warmup_iters:        int
     measure_iters:       int
+    text_embedding_policy: str
     # Parameters
     total_params:        int
     trainable_params:    float   # float so NaN round-trips through CSV
     # FLOPs
     gflops:              float
     # Latency (ms)
+    cold_latency_ms:     float
     latency_mean_ms:     float
     latency_std_ms:      float
     latency_min_ms:      float
@@ -1065,6 +1248,13 @@ class ProfileResult:
     throughput_img_per_s: float
     # Memory
     peak_memory_gb:      float
+    # Component timing (GSNet rows only; NaN elsewhere)
+    component_iters:     int
+    component_clip_image_encoder_ms: float
+    component_dino_rsib_ms: float
+    component_ripd_qgff_ms: float
+    component_postprocess_ms: float
+    component_total_profiled_ms: float
     # Speedup (filled in combined CSV)
     speedup_vs_baseline: float
 
@@ -1113,6 +1303,12 @@ def profile_model(
         txt = torch.randn(*config.text_shape,  device=device)
     inputs = (img, txt)
 
+    def _forward():
+        if amp and device.type == "cuda":
+            with torch.cuda.amp.autocast():
+                return callable_model(*inputs)
+        return callable_model(*inputs)
+
     # ── 3. Parameter count ───────────────────────────────────────────────────
     if modules_for_params is not None:
         # Deduplicate via object identity: GSDistillStudent registers clip_model
@@ -1132,7 +1328,17 @@ def profile_model(
         total_p, train_p = count_params(callable_model)
     print(f"  Params: {total_p:,} total, {train_p:,} trainable")
 
-    # ── 4. FLOPs (single forward, no grad) ───────────────────────────────────
+    text_policy = _text_embedding_policy(callable_model)
+
+    # ── 4. Cold first-call latency ───────────────────────────────────────────
+    # This call intentionally happens before FLOPs/warmup. For GSNet, it
+    # populates eval text caches, so subsequent FLOPs and latency represent
+    # steady-state cached inference.
+    print("  Cold first-call latency ...", end=" ", flush=True)
+    cold_latency_ms = _time_one_forward(_forward, device, amp=amp)
+    print(f"{cold_latency_ms:.1f}ms")
+
+    # ── 5. FLOPs (single cached/steady-state forward, no grad) ────────────────
     # Some models attach a `.flops_model` (e.g. GSNet, see _GSNetFlopsWrapper)
     # that traces cleanly under fvcore while the real callable doesn't.
     flops_model = getattr(callable_model, "flops_model", callable_model)
@@ -1151,14 +1357,8 @@ def profile_model(
             gpu_name = "unknown_gpu"
     precision_str = "float16 (AMP)" if amp else "float32"
 
-    # ── 5 & 6. Warmup + measurement ──────────────────────────────────────────
+    # ── 6 & 7. Warmup + steady-state measurement ─────────────────────────────
     latencies_ms: List[float] = []
-
-    def _forward():
-        if amp and device.type == "cuda":
-            with torch.cuda.amp.autocast():
-                return callable_model(*inputs)
-        return callable_model(*inputs)
 
     print(f"  Warmup ({WARMUP_ITERS} iters) ...", end=" ", flush=True)
     with torch.no_grad():
@@ -1185,7 +1385,7 @@ def profile_model(
 
     latencies_ms_t = torch.tensor(latencies_ms)
     lat_mean = float(latencies_ms_t.mean())
-    lat_std  = float(latencies_ms_t.std())
+    lat_std  = float(latencies_ms_t.std(unbiased=False))
     lat_min  = float(latencies_ms_t.min())
     lat_p50  = float(latencies_ms_t.quantile(0.50))
     lat_p95  = float(latencies_ms_t.quantile(0.95))
@@ -1194,6 +1394,23 @@ def profile_model(
     print(f"  Latency: mean={lat_mean:.1f}ms  std={lat_std:.1f}ms  "
           f"min={lat_min:.1f}ms  p50={lat_p50:.1f}ms  p95={lat_p95:.1f}ms")
     print(f"  Throughput: {throughput:.2f} img/s")
+
+    component_iters = int(getattr(args, "component_iters", 50))
+    component_metrics = _profile_gsnet_components(
+        callable_model=callable_model,
+        inputs=inputs,
+        device=device,
+        amp=amp,
+        iters=component_iters,
+    )
+    if component_metrics["component_iters"] > 0:
+        print(
+            "  Components: "
+            f"CLIP={component_metrics['component_clip_image_encoder_ms']:.1f}ms  "
+            f"DINO/RSIB={component_metrics['component_dino_rsib_ms']:.1f}ms  "
+            f"RIPD/QGFF={component_metrics['component_ripd_qgff_ms']:.1f}ms  "
+            f"post={component_metrics['component_postprocess_ms']:.1f}ms"
+        )
 
     # ── 7. Peak memory (separate single-pass measurement) ────────────────────
     peak_gb = float("nan")
@@ -1229,9 +1446,11 @@ def profile_model(
         batch_size           = b,
         warmup_iters         = WARMUP_ITERS,
         measure_iters        = MEASURE_ITERS,
+        text_embedding_policy = text_policy,
         total_params         = total_p,
         trainable_params     = float(train_p),
         gflops               = gflops,
+        cold_latency_ms      = cold_latency_ms,
         latency_mean_ms      = lat_mean,
         latency_std_ms       = lat_std,
         latency_min_ms       = lat_min,
@@ -1239,6 +1458,12 @@ def profile_model(
         latency_p95_ms       = lat_p95,
         throughput_img_per_s = throughput,
         peak_memory_gb       = peak_gb,
+        component_iters      = int(component_metrics["component_iters"]),
+        component_clip_image_encoder_ms = component_metrics["component_clip_image_encoder_ms"],
+        component_dino_rsib_ms = component_metrics["component_dino_rsib_ms"],
+        component_ripd_qgff_ms = component_metrics["component_ripd_qgff_ms"],
+        component_postprocess_ms = component_metrics["component_postprocess_ms"],
+        component_total_profiled_ms = component_metrics["component_total_profiled_ms"],
         speedup_vs_baseline  = float("nan"),   # filled in combine_results()
     )
 
@@ -1250,13 +1475,20 @@ def profile_model(
 _CSV_FIELDS = [
     "experiment_name", "description",
     "device", "gpu_name", "precision", "input_resolution", "batch_size",
-    "warmup_iters", "measure_iters",
+    "warmup_iters", "measure_iters", "text_embedding_policy",
     "total_params", "trainable_params",
     "gflops",
+    "cold_latency_ms",
     "latency_mean_ms", "latency_std_ms", "latency_min_ms",
     "latency_p50_ms", "latency_p95_ms",
     "throughput_img_per_s",
     "peak_memory_gb",
+    "component_iters",
+    "component_clip_image_encoder_ms",
+    "component_dino_rsib_ms",
+    "component_ripd_qgff_ms",
+    "component_postprocess_ms",
+    "component_total_profiled_ms",
     "speedup_vs_baseline",
 ]
 
@@ -1456,6 +1688,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--measure-iters", type=int, default=MEASURE_ITERS,
         help="Number of measurement iterations.",
+    )
+    p.add_argument(
+        "--component-iters", type=int, default=50,
+        help="Number of steady-state component-timing iterations for GSNet rows. Use 0 to disable.",
     )
     # ── Checkpoint paths (used when real models are connected) ────────────────
     # These are currently ignored by dummy loaders.  The connecting agent
