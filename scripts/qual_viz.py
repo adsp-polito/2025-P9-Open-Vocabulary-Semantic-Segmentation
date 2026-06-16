@@ -430,7 +430,8 @@ def save_image_and_gt(entries_by_dataset, output_dir):
             img_pil.save(str(out_folder / "00_image.png"))
 
             # GT label
-            gt = load_gt(entry["sem_seg_file"], ignore_label)
+            gt_key = "sem_seg_file_name" if "sem_seg_file_name" in entry else "sem_seg_file"
+            gt = load_gt(entry[gt_key], ignore_label)
             save_coloured(gt, palette, ignore_label, str(out_folder / "01_gt.png"))
 
             print(f"  [{dataset_name}] {stem}: image + GT saved")
